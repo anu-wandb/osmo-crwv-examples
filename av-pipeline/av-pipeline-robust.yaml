@@ -547,12 +547,14 @@ workflow:
           import imageio.v2 as imageio
 
           # ROBUST: parallelize across all visible GPUs. Each prompt runs in a
-          # subprocess pinned to one GPU via CUDA_VISIBLE_DEVICES. 100 prompts
-          # at ~6 min each finish in ~80 min on an 8-GPU node instead of ~10 hr.
-          import multiprocessing as _mp
+          # subprocess pinned to one GPU via CUDA_VISIBLE_DEVICES. Threads (not
+          # processes) so spawning workers doesn't recursively re-execute this
+          # script — we already saw spawn-context ProcessPoolExecutor blow up
+          # in av-pipeline-robust-1: workers re-ran the top-level probe and
+          # then tried to start their own pools, hitting RuntimeError.
           import torch as _torch
           NUM_GPUS = _torch.cuda.device_count() or 1
-          print(f"[gen] parallel mode: {NUM_GPUS} GPU workers", flush=True)
+          print(f"[gen] parallel mode: {NUM_GPUS} GPU workers (thread pool)", flush=True)
 
           def _gen_one(gpu_id, prompt_dict, cmd_template, fps, frames_per, H, W,
                         data_dir_str, video_dir_str, task_to_idx_dict):
@@ -614,9 +616,8 @@ workflow:
 
           task_to_idx = {p["text"]: i for i, p in enumerate(PROMPTS)}
           n_done = n_real = n_failed = 0
-          from concurrent.futures import ProcessPoolExecutor, as_completed
-          ctx = _mp.get_context("spawn")
-          with ProcessPoolExecutor(max_workers=NUM_GPUS, mp_context=ctx) as ex:
+          from concurrent.futures import ThreadPoolExecutor, as_completed
+          with ThreadPoolExecutor(max_workers=NUM_GPUS) as ex:
               futures = []
               for i, p in enumerate(PROMPTS):
                   gpu = i % NUM_GPUS
