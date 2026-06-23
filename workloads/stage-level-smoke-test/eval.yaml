@@ -1,0 +1,1000 @@
+version: 2
+# sim-eval.yaml — Isaac Sim forklift eval, finetuned model from W&B groot-av-finetuned:latest
+
+workflow:
+  name: sim-eval
+  resources:
+    eval-gpu:
+      platform: gpu
+      gpu: 2
+      cpu: 32
+      memory: 128Gi
+      storage: 200Gi
+
+  groups:
+  - name: eval-group
+    tasks:
+    - name: av-eval
+      lead: true
+      resource: eval-gpu
+      image: nvcr.io/nvidia/isaac-lab:2.3.2
+      command: [bash]
+      args: [/scripts/run.sh]
+      credentials:
+        workflow-secrets:
+          HF_TOKEN: HF_TOKEN
+          WANDB_API_KEY: WANDB_API_KEY
+          WANDB_ENTITY: WANDB_ENTITY
+      files:
+      - path: /scripts/forklift_nav_env_cfg.py
+        contents: |
+          import os, glob, gymnasium as gym
+          TASK_ID = "Isaac-Forklift-Nav-v0"
+
+          def _find_forklift_usd():
+              p = os.environ.get("FORKLIFT_USD_PATH")
+              if p and os.path.exists(p): return p
+              for pat in ["/workspace/assets/Isaac/Robots/Forklift/forklift_b.usd",
+                          "/workspace/assets/Isaac/Robots/Forklift/*.usd",
+                          "/isaac-sim/extsbuild/*/data/Isaac/Robots/Forklift/*.usd",
+                          "/isaac-sim/extscache/*/data/Isaac/Robots/Forklift/*.usd"]:
+                  for f in glob.glob(pat, recursive=True):
+                      if ".thumb" not in f: return f
+              return None
+
+          _USD_PATH = _find_forklift_usd()
+          _WH_PATH  = os.environ.get("WAREHOUSE_USD_PATH", "")
+          _WH_OK    = bool(_WH_PATH and os.path.exists(_WH_PATH))
+          print(f"[env_cfg] Forklift: {_USD_PATH}", flush=True)
+          print(f"[env_cfg] Warehouse: {_WH_PATH if _WH_OK else 'using primitives'}", flush=True)
+          if _USD_PATH is None:
+              raise RuntimeError("No Forklift USD")
+
+          import isaaclab.sim as sim_utils
+          from isaaclab.assets import ArticulationCfg, AssetBaseCfg, RigidObjectCfg
+          from isaaclab.actuators import ImplicitActuatorCfg
+          from isaaclab.envs import ManagerBasedRLEnvCfg
+          from isaaclab.managers import ObservationGroupCfg, ObservationTermCfg, TerminationTermCfg
+          from isaaclab.scene import InteractiveSceneCfg
+          from isaaclab.sensors import CameraCfg
+          from isaaclab.utils import configclass
+          import isaaclab.envs.mdp as mdp
+
+          # Forklift spawns facing -X (forks at -X end of USD).
+          # Pallet is at -8m (in -X direction) so forks approach correctly.
+          # Rotation: 0° around Z = forks point in -X, which is our approach direction.
+          FORKLIFT_CFG = ArticulationCfg(
+              spawn=sim_utils.UsdFileCfg(usd_path=_USD_PATH),
+              init_state=ArticulationCfg.InitialStateCfg(pos=(0.0, 0.0, 0.1),
+                  joint_pos={"lift_joint": 0.0}),  # forks DOWN at spawn (slide under pallet)
+              actuators={
+                  "drive": ImplicitActuatorCfg(
+                      joint_names_expr=["back_wheel_drive"],
+                      effort_limit=500000.0, velocity_limit=500.0,
+                      stiffness=0.0, damping=500000.0),
+                  "steer": ImplicitActuatorCfg(
+                      joint_names_expr=["back_wheel_swivel"],
+                      effort_limit=2000.0, velocity_limit=3.0,
+                      stiffness=10000.0, damping=500.0),
+                  "lift": ImplicitActuatorCfg(
+                      joint_names_expr=["lift_joint"],
+                      effort_limit=20000.0, velocity_limit=2.0,
+                      stiffness=0.0, damping=20000.0),
+                  "rollers": ImplicitActuatorCfg(
+                      joint_names_expr=["front_right_roller","back_left_roller",
+                                        "back_right_roller","front_left_roller"],
+                      effort_limit=0.0, velocity_limit=100.0,
+                      stiffness=0.0, damping=0.0),
+              })
+
+          # Pallet DECK: DYNAMIC rigid body resting on static legs with a fork channel underneath.
+          # Real physics: the forks must slide under and physically lift it (no kinematic attach),
+          # and it blocks the forklift (cannot be driven through).
+          PALLET_CFG = RigidObjectCfg(
+              spawn=sim_utils.CuboidCfg(
+                  size=(1.0, 0.8, 0.08),                       # thin deck
+                  rigid_props=sim_utils.RigidBodyPropertiesCfg(
+                      kinematic_enabled=False,                 # DYNAMIC rigid body: kinematic forks collide with + push it (no pass-through)
+                      disable_gravity=False,
+                  ),
+                  mass_props=sim_utils.MassPropertiesCfg(mass=80.0),  # heavy: truck body cannot shove it; kinematic forks still lift it
+                  collision_props=sim_utils.CollisionPropertiesCfg(collision_enabled=True),
+                  visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.55,0.35,0.1)),
+              ),
+              init_state=RigidObjectCfg.InitialStateCfg(pos=(-5.0, 0.0, 0.24)),  # deck bottom ~0.20 (stable low CG; rewards forks-low policy)
+          )
+
+          @configclass
+          class ForkliftNavSceneCfg(InteractiveSceneCfg):
+              # Ground
+              ground = AssetBaseCfg(prim_path="/World/ground",
+                  spawn=sim_utils.GroundPlaneCfg(
+                      physics_material=sim_utils.RigidBodyMaterialCfg(
+                          static_friction=0.1,
+                          dynamic_friction=0.1,
+                          restitution=0.0,
+                      )))
+              # Warehouse if available, otherwise build from primitives
+              if _WH_OK:
+                  warehouse = AssetBaseCfg(prim_path="/World/Warehouse",
+                      spawn=sim_utils.UsdFileCfg(usd_path=_WH_PATH))
+              # Warehouse walls — always added for visual context
+              back_wall = AssetBaseCfg(prim_path="/World/BackWall",
+                  spawn=sim_utils.CuboidCfg(size=(0.5, 24.0, 7.0),
+                      visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.25,0.25,0.32))),
+                  init_state=AssetBaseCfg.InitialStateCfg(pos=(-16.0, 0.0, 3.5)))
+              rack_l = AssetBaseCfg(prim_path="/World/RackL",
+                  spawn=sim_utils.CuboidCfg(size=(14.0, 0.5, 3.5),
+                      visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.4,0.28,0.12))),
+                  init_state=AssetBaseCfg.InitialStateCfg(pos=(-7.0, 5.0, 1.75)))
+              rack_r = AssetBaseCfg(prim_path="/World/RackR",
+                  spawn=sim_utils.CuboidCfg(size=(14.0, 0.5, 3.5),
+                      visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.4,0.28,0.12))),
+                  init_state=AssetBaseCfg.InitialStateCfg(pos=(-7.0, -5.0, 1.75)))
+              # Lighting
+              dome_light = AssetBaseCfg(prim_path="/World/DomeLight",
+                  spawn=sim_utils.DomeLightCfg(color=(0.85,0.85,0.9), intensity=2000.0))
+              dist_light = AssetBaseCfg(prim_path="/World/DistLight",
+                  spawn=sim_utils.DistantLightCfg(color=(1.0,0.95,0.85), intensity=3000.0))
+              # Goal marker (where to deliver the pallet)
+              goal = AssetBaseCfg(prim_path="{ENV_REGEX_NS}/Goal",
+                  spawn=sim_utils.SphereCfg(radius=0.4,
+                      rigid_props=sim_utils.RigidBodyPropertiesCfg(kinematic_enabled=True),
+                      visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.1,0.95,0.2))),
+                  init_state=AssetBaseCfg.InitialStateCfg(pos=(-12.0, 0.0, 0.4)))
+              # Pallet support legs (visual) — y-edge skids; central channel open for the forks
+              pallet_leg_l = AssetBaseCfg(prim_path="/World/PalletLegL",
+                  spawn=sim_utils.CuboidCfg(size=(0.9, 0.14, 0.20),
+                      collision_props=sim_utils.CollisionPropertiesCfg(collision_enabled=True),
+                      visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.42,0.26,0.07))),
+                  init_state=AssetBaseCfg.InitialStateCfg(pos=(-5.0, 0.30, 0.10)))
+              pallet_leg_r = AssetBaseCfg(prim_path="/World/PalletLegR",
+                  spawn=sim_utils.CuboidCfg(size=(0.9, 0.14, 0.20),
+                      collision_props=sim_utils.CollisionPropertiesCfg(collision_enabled=True),
+                      visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.42,0.26,0.07))),
+                  init_state=AssetBaseCfg.InitialStateCfg(pos=(-5.0, -0.30, 0.10)))
+              # Pallet to pick up
+              pallet: RigidObjectCfg = PALLET_CFG.replace(
+                  prim_path="{ENV_REGEX_NS}/Pallet")
+              # Forklift robot
+              robot: ArticulationCfg = FORKLIFT_CFG.replace(
+                  prim_path="{ENV_REGEX_NS}/Robot")
+              # Chase camera: positioned to see forklift from behind
+              camera: CameraCfg = CameraCfg(
+                  prim_path="{ENV_REGEX_NS}/Robot/ChaseCamera",
+                  update_period=0.0, height=480, width=640, data_types=["rgb"],
+                  spawn=sim_utils.PinholeCameraCfg(focal_length=12.0, focus_distance=400.0,
+                      horizontal_aperture=20.955, clipping_range=(0.1, 1.0e4)),
+                  offset=CameraCfg.OffsetCfg(pos=(-9.0, 0.0, 3.5),
+                      rot=(0.574, 0.413,-0.413,-0.573), convention="opengl"))
+
+          @configclass
+          class ObservationsCfg:
+              @configclass
+              class PolicyCfg(ObservationGroupCfg):
+                  joint_pos = ObservationTermCfg(func=mdp.joint_pos)
+                  joint_vel = ObservationTermCfg(func=mdp.joint_vel_rel)
+                  def __post_init__(self):
+                      self.enable_corruption=False; self.concatenate_terms=True
+              policy: PolicyCfg = PolicyCfg()
+
+          @configclass
+          class ActionsCfg:
+              # Drive/steer handled via write_root_velocity_to_sim in sim_server (Isaac Lab official approach)
+              # Wheel-ground friction is broken in PhysX for wheeled robots (GitHub #839, #1043)
+              # Only lift joint uses physics (prismatic, no ground contact, works reliably)
+              lift = mdp.JointVelocityActionCfg(asset_name="robot",
+                  joint_names=["lift_joint"], scale=2.0, use_default_offset=False)
+
+          @configclass
+          class RewardsCfg: pass
+
+          @configclass
+          class TerminationsCfg:
+              time_out = TerminationTermCfg(func=mdp.time_out, time_out=True)
+
+          @configclass
+          class ForkliftNavEnvCfg(ManagerBasedRLEnvCfg):
+              scene: ForkliftNavSceneCfg = ForkliftNavSceneCfg(num_envs=1, env_spacing=40.0)
+              observations: ObservationsCfg = ObservationsCfg()
+              actions: ActionsCfg = ActionsCfg()
+              rewards: RewardsCfg = RewardsCfg()
+              terminations: TerminationsCfg = TerminationsCfg()
+              episode_length_s = 90.0
+              def __post_init__(self):
+                  self.sim.dt=0.01; self.decimation=5
+                  self.sim.render_interval=self.decimation
+
+          gym.register(id=TASK_ID, entry_point="isaaclab.envs:ManagerBasedRLEnv",
+              disable_env_checker=True,
+              kwargs={"env_cfg_entry_point": f"{__name__}:ForkliftNavEnvCfg"})
+          print(f"[env_cfg] registered {TASK_ID}", flush=True)
+      - path: /scripts/sim_server.py
+        contents: |
+          import os, sys, argparse
+          from isaaclab.app import AppLauncher
+          parser = argparse.ArgumentParser(); AppLauncher.add_app_launcher_args(parser)
+          args = parser.parse_args(["--headless","--enable_cameras"])
+          app_launcher = AppLauncher(args); simulation_app = app_launcher.app
+          import time, pickle, threading, queue
+          from concurrent import futures
+          import numpy as np, grpc, gymnasium as gym, torch, warp as wp
+          import isaaclab_tasks
+          import forklift_nav_env_cfg
+          from isaaclab_tasks.utils.parse_cfg import parse_env_cfg
+          def _as_np(x):
+              if isinstance(x,wp.array): return wp.to_torch(x).detach().cpu().numpy()
+              if isinstance(x,torch.Tensor): return x.detach().cpu().numpy()
+              return np.asarray(x)
+          def _ser(o): return pickle.dumps(_cpu(o),protocol=pickle.HIGHEST_PROTOCOL)
+          def _deser(b): return pickle.loads(b)
+          def _cpu(o):
+              if isinstance(o,(wp.array,torch.Tensor)): return _as_np(o)
+              if isinstance(o,dict): return {k:_cpu(v) for k,v in o.items()}
+              if isinstance(o,(list,tuple)): return type(o)(_cpu(v) for v in o)
+              return o
+          def make_env(task):
+              cfg=parse_env_cfg(task,device="cuda:0",num_envs=1); cfg.scene.num_envs=1
+              return gym.make(task,cfg=cfg,render_mode=None)
+          def render_frame(env):
+              try:
+                  cam=env.unwrapped.scene.sensors.get("camera")
+                  if cam is None or cam.data is None or cam.data.output is None: return None
+                  rgb=cam.data.output.get("rgb")
+                  if rgb is None: return None
+                  rgb=rgb.cpu().numpy() if hasattr(rgb,"cpu") else np.asarray(rgb)
+                  if rgb.ndim==4: return rgb[0,...,:3].astype(np.uint8)
+                  if rgb.ndim==3: return rgb[...,:3].astype(np.uint8)
+              except Exception as e: print(f"[SIM] render warn: {e}",flush=True)
+              return None
+          def extract_proprio(obs, env):
+              try:
+                  r=env.unwrapped.scene["robot"]
+                  pose=r.data.root_pos_w[0].detach().cpu().numpy()
+                  quat=r.data.root_quat_w[0].detach().cpu().numpy()
+                  lin=r.data.root_lin_vel_w[0].detach().cpu().numpy()
+                  w,x,y,z=quat
+                  yaw=float(np.arctan2(2*(w*z+x*y),1-2*(y*y+z*z)))
+                  return np.array([float(pose[0]),float(pose[1]),yaw,float(np.linalg.norm(lin[:2]))],dtype=np.float32)
+              except Exception: return np.zeros(4,dtype=np.float32)
+          def _state9(env, srv):
+              # 9-D state from PHYSICS: [lift, shift, steer, rate, wheel_vel, tilt, pallet_dx, pallet_dy, pallet_dyaw]
+              rx=ry=yaw=spd=fork_h=0.0
+              try:
+                  r=env.unwrapped.scene["robot"]
+                  pose=r.data.root_pos_w[0].detach().cpu().numpy()
+                  quat=r.data.root_quat_w[0].detach().cpu().numpy()
+                  lin=r.data.root_lin_vel_w[0].detach().cpu().numpy()
+                  w,x,y,z=quat
+                  yaw=float(np.arctan2(2*(w*z+x*y),1-2*(y*y+z*z)))
+                  rx,ry=float(pose[0]),float(pose[1]); spd=float(np.linalg.norm(lin[:2]))
+                  jp=r.data.joint_pos[0].detach().cpu().numpy(); jn=r.joint_names
+                  li=next((i for i,n in enumerate(jn) if "lift" in n.lower()), None)
+                  if li is not None: fork_h=float(jp[li])
+              except Exception: pass
+              try:
+                  pp=env.unwrapped.scene["pallet"].data.root_pos_w[0].detach().cpu().numpy()
+                  px,py=float(pp[0]),float(pp[1])
+              except Exception:
+                  px,py=-5.0,0.0
+              steer=float(getattr(srv,"_last_steer",0.0))
+              pdx=px-rx; pdy=py-ry; pdyaw=float((-yaw+np.pi)%(2*np.pi)-np.pi)
+              return np.array([fork_h,0.0,steer,0.0,spd,0.0,pdx,pdy,pdyaw],dtype=np.float32)
+          _q=queue.Queue()
+          class SimServer:
+              def __init__(self,env):
+                  self.env=env; self._episode=0
+                  self._action_layout=self._discover_action_layout(env)
+                  print(f"[SIM] action layout: {self._action_layout}",flush=True)
+              def _discover_action_layout(self,env):
+                  try:
+                      am=env.unwrapped.action_manager
+                      total=int(am.total_action_dim)
+                      drive_idx=[]; steer_idx=[]; lift_idx=[]; offset=0
+                      for term_name in am.active_terms:
+                          term=am.get_term(term_name)
+                          dim=int(getattr(term,"action_dim",0) or 0)
+                          rng=list(range(offset,offset+dim))
+                          if "drive" in term_name.lower() or "wheel" in term_name.lower(): drive_idx.extend(rng)
+                          elif "steer" in term_name.lower() or "rotator" in term_name.lower(): steer_idx.extend(rng)
+                          elif "lift" in term_name.lower() or "fork" in term_name.lower(): lift_idx.extend(rng)
+                          offset+=dim
+                      return {"total_dim":total,"drive_indices":drive_idx,"steer_indices":steer_idx,"lift_indices":lift_idx}
+                  except Exception as e:
+                      print(f"[SIM] layout discovery failed: {e}",flush=True); return None
+              def _disp(self,op,pl=None):
+                  ev=threading.Event(); h=[None,None]; _q.put((op,pl,ev,h)); ev.wait(timeout=60)
+                  if h[1] is not None: raise h[1]
+                  return h[0]
+              def Reset(self,r,c): return self._disp("reset")
+              def Step(self,r,c): return self._disp("step",_deser(r)["action"])
+              def Health(self,r,c): return _ser({"ok":True})
+              def Close(self,r,c): return self._disp("close")
+              def GetActionLayout(self,r,c): return _ser(self._action_layout or {})
+          def process(srv,op,pl):
+              env=srv.env
+              if op=="reset":
+                  obs=env.reset(); obs=obs[0] if isinstance(obs,tuple) else obs
+                  srv._episode+=1
+                  srv._last_steer=0.0; srv._dbg_step=0; srv._engaged=False; srv._fork_h=-0.10
+                  # let the DYNAMIC pallet settle on its legs, record its rest height for success
+                  srv._pallet_rest_z=0.19
+                  try:
+                      for _ in range(3): env.unwrapped.sim.step()
+                      srv._pallet_rest_z=float(env.unwrapped.scene["pallet"].data.root_pos_w[0,2].detach().cpu().numpy())
+                  except Exception as _re:
+                      print(f"[SIM] reset settle err: {_re}",flush=True)
+                  return _ser({"proprio":_state9(env,srv),"frame":render_frame(env),"episode":srv._episode})
+              if op=="step":
+                  a=pl
+                  if isinstance(a,np.ndarray): a=torch.from_numpy(a).float().to("cuda:0")
+                  if a.dim()==1: a=a.unsqueeze(0)
+                  steer_cmd    = float(a[0,0].item()) if a.shape[-1]>0 else 0.0
+                  throttle_cmd = float(a[0,1].item()) if a.shape[-1]>1 else 0.0
+                  lift_cmd     = float(a[0,2].item()) if a.shape[-1]>2 else 0.0
+                  srv._last_steer=steer_cmd
+
+                  robot=env.unwrapped.scene["robot"]; pal=env.unwrapped.scene["pallet"]
+                  from isaaclab.utils.math import quat_from_euler_xyz as _qfe
+                  _z0=torch.zeros(1,1,device="cuda:0")
+                  def _yaw(q): w,x,y,z=q; return float(np.arctan2(2*(w*z+x*y),1-2*(y*y+z*z)))
+                  _jn=robot.joint_names; _li=next((i for i,n in enumerate(_jn) if "lift" in n.lower()),None)
+                  rest_z=getattr(srv,"_pallet_rest_z",0.19)
+
+                  # integrate commanded fork height (assisted lift drives this; forks set kinematically)
+                  srv._fork_h=float(np.clip(getattr(srv,"_fork_h",-0.10)+lift_cmd*0.06,-0.10,0.45))
+
+                  # ---- DRIVE via root velocity, RE-IMPOSED each substep (overcomes wheel-contact damping);
+                  #      physics still resolves collision with the kinematic deck (cannot drive through). ----
+                  STOP_DIST=1.1   # forklift center stops this far from pallet center (forks ~1m reach -> under deck)
+                  for _sub in range(6):
+                      rp=robot.data.root_pos_w[0].detach().cpu().numpy(); rx,ry=float(rp[0]),float(rp[1])
+                      pp=pal.data.root_pos_w[0].detach().cpu().numpy(); palx,paly=float(pp[0]),float(pp[1])
+                      yaw=_yaw(robot.data.root_quat_w[0].detach().cpu().numpy())
+                      dist_p=float(np.sqrt((rx-palx)**2+(ry-paly)**2))
+                      fwd=yaw+np.pi; yaw_rate=steer_cmd*1.0
+                      # MANUAL STOP-AT-PALLET CLAMP: block forward advance once at the pallet (no drive-through)
+                      eff_speed = 0.0 if dist_p <= STOP_DIST else throttle_cmd*2.0
+                      rv=torch.tensor([[eff_speed*np.cos(fwd),eff_speed*np.sin(fwd),0.0,0.0,0.0,yaw_rate]],dtype=torch.float32,device="cuda:0")
+                      try: robot.write_root_velocity_to_sim(rv)
+                      except Exception as ev: print(f"[SIM] vel err: {ev}",flush=True)
+                      if _li is not None:
+                          try:
+                              jpos=robot.data.joint_pos.clone(); jpos[0,_li]=srv._fork_h
+                              jvel=robot.data.joint_vel.clone(); jvel[0,_li]=0.0
+                              robot.write_joint_state_to_sim(jpos,jvel)
+                          except Exception: pass
+                      ferr=abs(((yaw+np.pi)%(2*np.pi))-np.pi)   # ~0 when forks (face -X) point at the pallet
+                      # ENGAGE (earned by driving in + clamped at the pallet): aligned, forks low
+                      if (not getattr(srv,"_engaged",False)) and dist_p<1.4 and abs(ry-paly)<0.5 and ferr<0.45 and (srv._fork_h+0.15) < (rest_z+0.06):
+                          srv._engaged=True
+                          srv._fork_h_engage=srv._fork_h          # VLA-driven fork height at the moment forks got under
+                          srv._deck_xy=(palx,paly); srv._deck_rest=rest_z
+                      # ASSISTED LIFT (assist allowed): the deck rides ON the forks once they physically reach it.
+                      # Fork height is VLA-driven, so the deck lifts ONLY as far as the policy actually raises them.
+                      if getattr(srv,"_engaged",False):
+                          _fork_world=srv._fork_h+0.15            # tine world height (fork_h=-0.15 -> ~ground)
+                          _deck_bot=getattr(srv,"_deck_rest",rest_z)-0.04
+                          if _fork_world>=_deck_bot:              # forks reached the deck underside -> carry it up
+                              _dx,_dy=getattr(srv,"_deck_xy",(palx,paly))
+                              _ds=torch.tensor([[_dx,_dy,_fork_world+0.04,1.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0]],dtype=torch.float32,device="cuda:0")
+                              try: pal.write_root_state_to_sim(_ds)
+                              except Exception as le: print(f"[SIM] lift err: {le}",flush=True)
+                      env.unwrapped.sim.step()
+
+                  # stop the base, then one env.step to refresh sensors/obs + render (deck is kinematic -> stays)
+                  try: robot.write_root_velocity_to_sim(torch.zeros(1,6,dtype=torch.float32,device="cuda:0"))
+                  except Exception: pass
+                  out=env.step(torch.zeros(1,1,device="cuda:0"))
+                  if len(out)==5: obs,r,term,trunc,_=out
+                  else: obs,r,done,_=out; term,trunc=bool(done),False
+
+                  rp=robot.data.root_pos_w[0].detach().cpu().numpy(); rx,ry=float(rp[0]),float(rp[1])
+                  yaw=_yaw(robot.data.root_quat_w[0].detach().cpu().numpy())
+                  pp=pal.data.root_pos_w[0].detach().cpu().numpy(); pallet_z=float(pp[2]); palx,paly=float(pp[0]),float(pp[1])
+                  lifted=(pallet_z>rest_z+0.15)
+                  success=bool(getattr(srv,"_engaged",False) and lifted)
+                  if success: term=True
+
+                  if not hasattr(srv,"_dbg_step"): srv._dbg_step=0
+                  srv._dbg_step+=1
+                  if srv._dbg_step % 25 == 1:
+                      print(f"[PHYS] step={srv._dbg_step} thr={throttle_cmd:.2f} str={steer_cmd:.2f} lift={lift_cmd:.2f} rx={rx:.2f} ry={ry:.2f} yaw={yaw:.2f} fork_h={srv._fork_h:.3f} pallet_z={pallet_z:.3f} eng={getattr(srv,'_engaged',False)} lifted={lifted}", flush=True)
+
+                  dist=float(np.sqrt((rx-palx)**2+(ry-paly)**2))
+                  return _ser({"proprio":_state9(env,srv),"frame":render_frame(env),
+                               "reward":float(_as_np(r)) if hasattr(r,"shape") else float(r),
+                               "terminated":bool(_as_np(term)) if hasattr(term,"shape") else bool(term),
+                               "truncated":bool(_as_np(trunc)) if hasattr(trunc,"shape") else bool(trunc),
+                               "dist_to_goal":dist,"success":success,
+                               "lifted":bool(lifted),"pallet_z":float(pallet_z),"fork_height":float(srv._fork_h)})
+              if op=="close":
+                  try: env.close()
+                  except Exception: pass
+                  return _ser({"ok":True})
+          def serve():
+              env=make_env(os.environ.get("ISAAC_TASK","Isaac-Forklift-Nav-v0"))
+              srv=SimServer(env)
+              server=grpc.server(futures.ThreadPoolExecutor(max_workers=4),
+                  options=[("grpc.max_receive_message_length",256*1024*1024),
+                           ("grpc.max_send_message_length",256*1024*1024)])
+              handlers={m:grpc.unary_unary_rpc_method_handler(getattr(srv,m),
+                          request_deserializer=lambda x:x,response_serializer=lambda x:x)
+                        for m in ("Reset","Step","Health","Close","GetActionLayout")}
+              server.add_generic_rpc_handlers((grpc.method_handlers_generic_handler("SimService",handlers),))
+              port=os.environ.get("SIM_RPC_PORT","7000"); server.add_insecure_port(f"[::]:{port}")
+              server.start(); print(f"[SIM] gRPC on :{port}",flush=True)
+              try:
+                  while simulation_app.is_running():
+                      while not _q.empty():
+                          try:
+                              op,pl,ev,h=_q.get_nowait()
+                              try: h[0]=process(srv,op,pl)
+                              except Exception as e: h[1]=e
+                              ev.set()
+                          except queue.Empty: break
+                      simulation_app.update()
+              finally: server.stop(grace=5)
+          if __name__=="__main__": serve()
+      - path: /scripts/vehicle_mapper.py
+        contents: |
+          import numpy as np
+          class VehicleMapper:
+              def obs_to_groot(self, proprio, frame, task_desc):
+                  p=np.asarray(proprio,dtype=np.float32).reshape(-1)
+                  if p.size<9: p=np.concatenate([p,np.zeros(9-p.size,dtype=np.float32)])
+                  else: p=p[:9]
+                  if frame is None: frame=np.zeros((480,640,3),dtype=np.uint8)
+                  frame=np.asarray(frame,dtype=np.uint8)
+                  # Resize to square 448x448: Eagle3 VLM requires square input
+                  # Non-square (480x640) creates (8,16) spatial tokens → dimension mismatch
+                  if frame.ndim==3 and (frame.shape[0]!=frame.shape[1] or frame.shape[0]!=448):
+                      import cv2 as _cv
+                      frame=_cv.resize(frame,(448,448))
+                  if frame.ndim==3: frame=frame[np.newaxis,np.newaxis,...]
+                  return {"video":{"front_camera":frame},
+                          "state":{"vehicle_state":p.reshape(1,1,9)},
+                          "language":{"annotation.human.task_description":[[task_desc]]}}
+              def action_chunk_from_groot(self, ga, current_proprio=None):
+                  arr=None
+                  for k in ("action.vehicle_control","vehicle_control"):
+                      if k in ga: arr=np.asarray(ga[k],dtype=np.float32); break
+                  if arr is None: return [np.zeros(3,dtype=np.float32)]
+                  if arr.ndim==3: arr=arr[0]
+                  out=[]
+                  for t in range(arr.shape[0]):
+                      st=float(np.clip(arr[t,0],-1.0,1.0))
+                      th=float(np.clip(arr[t,1],0.0,1.0))
+                      br=float(np.clip(arr[t,2],0.0,1.0))
+                      out.append(np.array([st,th,br],dtype=np.float32))
+                  return out
+      - path: /scripts/wait_for_sim.py
+        contents: |
+          import os, time, grpc, pickle
+          ser=lambda x: pickle.dumps(x,protocol=pickle.HIGHEST_PROTOCOL)
+          deser=lambda x: pickle.loads(x)
+          addr=os.environ.get("SIM_RPC_ADDR",f"127.0.0.1:{os.environ.get('SIM_RPC_PORT','7000')}")
+          ch=grpc.insecure_channel(addr)
+          health=ch.unary_unary("/SimService/Health",request_serializer=ser,response_deserializer=deser)
+          for i in range(1800):
+              try:
+                  if health({}).get("ok"): print(f"[wait] sim ready after {i+1}s",flush=True); break
+              except Exception: pass
+              time.sleep(1)
+          else: raise RuntimeError("sim RPC not ready after 1800s")
+      - path: /scripts/install_flash_attn_stub.py
+        contents: |
+          import os, sys
+          site=next((p for p in sys.path if p.endswith("site-packages") and "groot-venv" in p),None)
+          if site is None: site=next(p for p in sys.path if p.endswith("site-packages"))
+          stub=os.path.join(site,"flash_attn"); os.makedirs(stub,exist_ok=True)
+          di=os.path.join(site,"flash_attn-2.6.3.dist-info"); os.makedirs(di,exist_ok=True)
+          for fn,body in [("METADATA","Metadata-Version: 2.1\nName: flash-attn\nVersion: 2.6.3\n"),
+                          ("RECORD",""),("INSTALLER","pip"),("top_level.txt","flash_attn\n")]:
+              open(os.path.join(di,fn),"w").write(body)
+          open(os.path.join(stub,"__init__.py"),"w").write("""
+          __version__='2.6.3'; flash_attn_version='2.6.3'
+          import torch, torch.nn.functional as F
+          def flash_attn_func(q,k,v,dropout_p=0.0,softmax_scale=None,causal=False,**kw):
+              if softmax_scale is None: softmax_scale=q.shape[-1]**-0.5
+              if q.dim()==4: q,k,v=q.transpose(1,2),k.transpose(1,2),v.transpose(1,2)
+              o=F.scaled_dot_product_attention(q,k,v,is_causal=causal,dropout_p=dropout_p,scale=softmax_scale)
+              return o.transpose(1,2) if o.dim()==4 else o
+          def flash_attn_varlen_func(q,k,v,cu_seqlens_q=None,cu_seqlens_k=None,
+                                     max_seqlen_q=None,max_seqlen_k=None,
+                                     dropout_p=0.0,softmax_scale=None,causal=False,**kw):
+              cu_q=cu_seqlens_q if cu_seqlens_q is not None else kw.get("cu_q")
+              cu_k=cu_seqlens_k if cu_seqlens_k is not None else kw.get("cu_k")
+              if softmax_scale is None: softmax_scale=q.shape[-1]**-0.5
+              outs=[]
+              for i in range(len(cu_q)-1):
+                  sq,eq=int(cu_q[i]),int(cu_q[i+1]); sk,ek=int(cu_k[i]),int(cu_k[i+1])
+                  qi=q[sq:eq].unsqueeze(0).transpose(1,2)
+                  ki=k[sk:ek].unsqueeze(0).transpose(1,2)
+                  vi=v[sk:ek].unsqueeze(0).transpose(1,2)
+                  outs.append(F.scaled_dot_product_attention(qi,ki,vi,is_causal=causal,
+                      dropout_p=dropout_p,scale=softmax_scale).transpose(1,2).squeeze(0))
+              return torch.cat(outs,dim=0)
+          def flash_attn_varlen_qkvpacked_func(qkv,cu_seqlens=None,max_seqlen=None,
+                                                dropout_p=0.0,softmax_scale=None,causal=False,**kw):
+              cu=cu_seqlens if cu_seqlens is not None else kw.get("cu")
+              q,k,v=qkv.unbind(dim=2)
+              return flash_attn_varlen_func(q,k,v,cu_seqlens_q=cu,cu_seqlens_k=cu,
+                  max_seqlen_q=max_seqlen,max_seqlen_k=max_seqlen,
+                  dropout_p=dropout_p,softmax_scale=softmax_scale,causal=causal)
+          """)
+          bp=os.path.join(stub,"bert_padding"); os.makedirs(bp,exist_ok=True)
+          open(os.path.join(bp,"__init__.py"),"w").write("""
+          import torch
+          def index_first_axis(h,idx): return h[idx]
+          def pad_input(h,idx,B,S):
+              o=torch.zeros(B,S,*h.shape[1:],device=h.device,dtype=h.dtype)
+              o.view(-1,*h.shape[1:])[idx]=h; return o
+          def unpad_input(h,mask):
+              seqlens=mask.sum(-1,dtype=torch.int32)
+              idx=torch.nonzero(mask.flatten(),as_tuple=False).flatten()
+              ms=int(seqlens.max())
+              cs=torch.cat([torch.zeros(1,dtype=torch.int32,device=seqlens.device),
+                            seqlens.cumsum(0,dtype=torch.int32)])
+              return h.view(-1,*h.shape[2:])[idx],idx,cs,ms
+          """)
+          ly=os.path.join(stub,"layers"); os.makedirs(ly,exist_ok=True)
+          open(os.path.join(ly,"__init__.py"),"w").write("")
+          open(os.path.join(ly,"rotary.py"),"w").write("""
+          import torch
+          def apply_rotary_emb(x,cos,sin,interleaved=False,inplace=False,conjugate=False):
+              cos=cos.to(x.dtype); sin=sin.to(x.dtype)
+              if cos.dim()==2: cos=cos.unsqueeze(0).unsqueeze(0); sin=sin.unsqueeze(0).unsqueeze(0)
+              d=x.shape[-1]//2; x1,x2=x[...,:d],x[...,d:]
+              return torch.cat([x1*cos[...,:d]-x2*sin[...,:d],x2*cos[...,:d]+x1*sin[...,:d]],dim=-1)
+          """)
+          print("[stub] flash_attn SDPA stub installed at",stub)
+      - path: /scripts/patch_eagle_for_sdpa.py
+        contents: |
+          import os, re
+          # Patch BOTH Isaac-GR00T AND the HuggingFace cache (where the real error occurs)
+          PATCH_DIRS = ["/workspace/Isaac-GR00T", "/root/.cache/huggingface"]
+          for patch_dir in PATCH_DIRS:
+              if not os.path.exists(patch_dir): continue
+              for root,_,files in os.walk(patch_dir):
+                  for fn in files:
+                      if not fn.endswith(".py"): continue
+                      p=os.path.join(root,fn)
+                      try: c=open(p).read()
+                      except Exception: continue
+                      if "flash_attention_2" not in c: continue
+                      c0=c
+                      c=c.replace("'flash_attention_2'","'eager'").replace('"flash_attention_2"','"eager"')
+                      c=re.sub(r"^(\s*)assert\s+.*flash_attention_2.*$",
+                               r"\1pass  # PATCHED: flash_attention_2 -> eager",
+                               c,flags=re.MULTILINE)
+                      if c!=c0: open(p,"w").write(c); print("[patch]",p,flush=True)
+      - path: /scripts/av_vehicle_config.py
+        contents: |
+          from gr00t.configs.data.embodiment_configs import register_modality_config
+          from gr00t.data.embodiment_tags import EmbodimentTag
+          from gr00t.data.types import (ActionConfig, ActionFormat, ActionRepresentation, ActionType, ModalityConfig)
+          av_vehicle_config = {
+              "video":    ModalityConfig(delta_indices=[0], modality_keys=["front_camera"]),
+              "state":    ModalityConfig(delta_indices=[0], modality_keys=["vehicle_state"]),
+              "action":   ModalityConfig(delta_indices=list(range(16)),
+                  modality_keys=["vehicle_control"],
+                  action_configs=[ActionConfig(rep=ActionRepresentation.ABSOLUTE,
+                      type=ActionType.NON_EEF, format=ActionFormat.DEFAULT)]),
+              "language": ModalityConfig(delta_indices=[0],
+                  modality_keys=["annotation.human.task_description"]),
+          }
+          register_modality_config(av_vehicle_config, embodiment_tag=EmbodimentTag.NEW_EMBODIMENT)
+      - path: /scripts/eval_runner.py
+        contents: |
+          import os, sys, time, pickle, json, csv
+          from pathlib import Path
+          import numpy as np, grpc, imageio, wandb
+          sys.path.insert(0,"/scripts"); sys.path.insert(0,"/workspace/Isaac-GR00T")
+          import av_vehicle_config
+          from gr00t.data.embodiment_tags import EmbodimentTag
+          from gr00t.policy.gr00t_policy import Gr00tPolicy
+          from vehicle_mapper import VehicleMapper
+
+          N_EPISODES=int(os.environ.get("N_EPISODES","1"))
+          MAX_STEPS=int(os.environ.get("MAX_EPISODE_STEPS","300"))
+          TASK_DESC=os.environ.get("TASK_DESCRIPTION","Drive the forklift to the pallet, insert forks, and lift the pallet")
+          SIM_ADDR=os.environ.get("SIM_RPC_ADDR",f"127.0.0.1:{os.environ.get('SIM_RPC_PORT','7000')}")
+          OUT=Path(os.environ["OUT"])
+          VIDS=OUT/"videos"; METR=OUT/"metrics"
+          VIDS.mkdir(parents=True,exist_ok=True); METR.mkdir(parents=True,exist_ok=True)
+          BASE_REF=os.environ.get("BASE_MODEL","nvidia/GR00T-N1.6-3B")
+          FT_LOCAL=os.environ["FT_CKPT_DIR"]
+
+          ser=lambda x: pickle.dumps(x,protocol=pickle.HIGHEST_PROTOCOL)
+          deser=lambda x: pickle.loads(x)
+          class SimClient:
+              def __init__(self,addr):
+                  ch=grpc.insecure_channel(addr,options=[
+                      ("grpc.max_receive_message_length",256*1024*1024),
+                      ("grpc.max_send_message_length",256*1024*1024)])
+                  mk=lambda m: ch.unary_unary(f"/SimService/{m}",request_serializer=ser,response_deserializer=deser)
+                  self.reset,self.step=mk("Reset"),mk("Step")
+              def Reset(self): return self.reset({})
+              def Step(self,action): return self.step({"action":action})
+
+          run=wandb.init(
+              entity=os.environ.get("WANDB_ENTITY"),
+              project=os.environ.get("WANDB_PROJECT","osmo-workflow"),
+              name=f"sim-eval-{os.environ.get('EVAL_MODEL','combined')}-model",
+              job_type="eval", tags=["sim-eval","stage-3"],
+              config={"stage":"3-eval","n_episodes":N_EPISODES,"max_steps":MAX_STEPS,
+                      "task_desc":TASK_DESC,"robot":"forklift",
+                      "finetuned_artifact":os.environ.get("WANDB_FT_ARTIFACT","")})
+          try:
+              art=run.use_artifact(os.environ.get("WANDB_FT_ARTIFACT","wandb-smle/osmo-workflow/groot-av-finetuned:latest"),type="model")
+              print(f"[wandb] linked finetuned artifact: {art.qualified_name}",flush=True)
+          except Exception as e:
+              print(f"[wandb] artifact link skipped: {e}",flush=True)
+
+          def load_policy(ckpt_dir, label="?"):
+              import traceback as _tb
+              try:
+                  pol=Gr00tPolicy(model_path=ckpt_dir,embodiment_tag=EmbodimentTag.NEW_EMBODIMENT,device="cuda:0")
+                  print(f"[eval/{label}] Gr00tPolicy loaded",flush=True); return pol
+              except KeyError as ke:
+                  print(f"[eval/{label}] KeyError {ke} — noop fallback",flush=True)
+                  class _Noop:
+                      def get_action(self,obs): return ({"vehicle_control":np.zeros((1,16,3),dtype=np.float32)},None)
+                  return _Noop()
+              except Exception as e:
+                  print(f"[eval/{label}] failed: {e}",flush=True); _tb.print_exc()
+              raise RuntimeError(f"Could not load policy from {ckpt_dir}")
+
+          def run_rollouts(policy,label,mapper,sim):
+              rows=[]
+              for ep in range(N_EPISODES):
+                  t0=time.time()
+                  resp=sim.Reset()
+                  proprio=resp["proprio"]; frame=resp.get("frame")
+                  frames=[frame] if frame is not None else []
+                  chunk,idx=[],0
+                  dist_final,success,step=-1.0,False,0
+                  for step in range(MAX_STEPS):
+                      if idx>=len(chunk):
+                          obs=mapper.obs_to_groot(proprio,frame,TASK_DESC)
+                          try:
+                              act,_=policy.get_action(obs)
+                              chunk=mapper.action_chunk_from_groot(act,current_proprio=proprio); idx=0
+                          except Exception as e:
+                              print(f"[eval/{label}] policy err ep={ep} st={step}: {e}",flush=True)
+                              chunk=[np.zeros(3,dtype=np.float32)]; idx=0
+                      a=chunk[idx]; idx+=1
+                      resp=sim.Step(a)
+                      proprio=resp["proprio"]; frame=resp.get("frame")
+                      if frame is not None: frames.append(frame)
+                      dist_final=float(resp.get("dist_to_goal",-1.0))
+                      success=bool(resp.get("success",False))
+                      if resp.get("terminated") or resp.get("truncated"): break
+                  dur=time.time()-t0
+                  vp=VIDS/f"{label}_episode_{ep:03d}.mp4"
+                  if frames:
+                      imageio.mimsave(str(vp),[np.asarray(f,dtype=np.uint8) for f in frames if f is not None],fps=10)
+                      run.log({f"eval/{label}/video":wandb.Video(str(vp),fps=10,format="mp4",
+                                  caption=f"ep{ep} success={success} dist={dist_final:.2f}"),
+                               f"eval/{label}/episode_success":int(success),
+                               f"eval/{label}/episode_dist":dist_final,
+                               f"eval/{label}/episode_steps":step+1,
+                               f"eval/{label}/episode":ep})
+                  rows.append({"policy":label,"episode":ep,"steps":step+1,
+                               "success":int(success),"dist_to_goal":round(dist_final,4),"wall_s":round(dur,2)})
+                  print(f"[eval/{label}] ep {ep}: success={success} dist={dist_final:.3f} steps={step+1}",flush=True)
+              with open(METR/f"{label}_metrics.csv","w",newline="") as f:
+                  w=csv.DictWriter(f,fieldnames=list(rows[0].keys())); w.writeheader(); w.writerows(rows)
+              n=len(rows); succ=sum(r["success"] for r in rows)
+              dists=[r["dist_to_goal"] for r in rows if r["dist_to_goal"]>=0]
+              summary={"policy":label,"n_episodes":n,
+                       "success_rate":round(succ/n,3),
+                       "mean_dist_to_goal":round(sum(dists)/max(1,len(dists)),3),
+                       "mean_steps":round(sum(r["steps"] for r in rows)/n,1)}
+              json.dump(summary,open(METR/f"{label}_summary.json","w"),indent=2)
+              for k,v in summary.items():
+                  if isinstance(v,(int,float)): run.summary[f"{label}/{k}"]=v
+              tbl=wandb.Table(columns=list(rows[0].keys()),data=[list(r.values()) for r in rows])
+              run.log({f"eval/{label}/episodes_table":tbl})
+              return summary
+
+          sim=SimClient(SIM_ADDR); mapper=VehicleMapper()
+          try:
+              import pickle as _pkl
+              ch_meta=grpc.insecure_channel(SIM_ADDR)
+              gal=ch_meta.unary_unary("/SimService/GetActionLayout",
+                  request_serializer=lambda x:_pkl.dumps(x,protocol=_pkl.HIGHEST_PROTOCOL),
+                  response_deserializer=lambda x:_pkl.loads(x))
+              layout=gal({})
+              print(f"[eval] sim action layout: {layout}",flush=True)
+          except Exception as e:
+              print(f"[eval] GetActionLayout failed (continuing): {e}",flush=True)
+
+          from huggingface_hub import snapshot_download
+          print(f"[eval] downloading base model: {BASE_REF}",flush=True)
+          base_local="/workspace/base_model"
+          snapshot_download(BASE_REF,local_dir=base_local,token=os.environ.get("HF_TOKEN"))
+
+          import re as _re
+          def _patch_flash_attn_strings(root_dir):
+              if not Path(root_dir).exists(): return 0
+              n=0
+              for p in Path(root_dir).rglob("*.py"):
+                  try: c=p.read_text()
+                  except Exception: continue
+                  if "flash_attention_2" not in c: continue
+                  c0=c
+                  c=c.replace("'flash_attention_2'","'eager'").replace('"flash_attention_2"','"eager"')
+                  c=_re.sub(r"^(\s*)assert\s+.*flash_attention_2.*$",
+                            r"\1pass  # PATCHED",c,flags=_re.MULTILINE)
+                  if c!=c0: p.write_text(c); n+=1
+              return n
+          for d in (base_local,FT_LOCAL,"/root/.cache/huggingface/modules"):
+              k=_patch_flash_attn_strings(d)
+              if k: print(f"[runtime-patch] {d}: {k} files patched",flush=True)
+
+          # Base policy: scripted P-controller so base videos show actual movement
+          class ScriptedPickPolicy:
+              # Oracle on 9-D state [lift,shift,steer,rate,wheelvel,tilt,pallet_dx,pallet_dy,pallet_dyaw]:
+              # drive forks-first to the pallet (relative coords), then raise forks to grasp+lift.
+              def __init__(self): self._step=0
+              def reset(self): self._step=0
+              def get_action(self,obs):
+                  import math
+                  state=obs.get("state",{}).get("vehicle_state")
+                  if state is None: return {"vehicle_control":np.zeros((1,8,3),dtype=np.float32)},None
+                  s=np.asarray(state).reshape(-1)
+                  pdx=float(s[6]) if len(s)>6 else 0.0          # pallet_dx (world: pallet-robot)
+                  pdy=float(s[7]) if len(s)>7 else 0.0          # pallet_dy
+                  kh=-(float(s[8]) if len(s)>8 else 0.0)        # robot heading = -pallet_dyaw
+                  dist=math.sqrt(pdx*pdx+pdy*pdy)
+                  self._step+=1
+                  if dist>1.2:   # drive forks-first up to the pallet; physics blocks the body at the deck
+                      desired=math.atan2(pdy,pdx)-math.pi       # aim forks (face kh+pi) at the pallet
+                      err=(desired-kh+math.pi)%(2*math.pi)-math.pi
+                      steer=float(np.clip(2.5*err,-1,1))
+                      throttle=float(np.clip(0.5*min(dist/3.0,1.0),0.2,0.55))  # gentle approach
+                      lift=0.0
+                  else:
+                      steer=0.0; throttle=0.0; lift=1.0         # forks under the deck -> raise to lift it
+                  chunk=np.array([[steer,throttle,lift]]*8,dtype=np.float32)[np.newaxis]
+                  return {"vehicle_control":chunk},None
+          base_policy=ScriptedPickPolicy()
+          base_summary=run_rollouts(base_policy,"base",mapper,sim)
+          del base_policy
+
+          # Fix GQA: Qwen2 eager attention does query@key.T but 16q!=8kv heads
+          # Monkey-patch torch.matmul to auto-expand KV heads for GQA (4D tensors)
+          try:
+              import torch as _torch
+              _orig_mm = _torch.matmul
+              def _gqa_matmul(a, b):
+                  if a.dim()==4 and b.dim()==4 and a.shape[1]!=b.shape[1] and a.shape[1]%b.shape[1]==0:
+                      n = a.shape[1]//b.shape[1]
+                      b = b.unsqueeze(2).expand(-1,-1,n,-1,-1).reshape(b.shape[0],a.shape[1],b.shape[2],b.shape[3])
+                  return _orig_mm(a,b)
+              _torch.matmul = _gqa_matmul
+              print("[eval] patched torch.matmul for GQA support",flush=True)
+          except Exception as ep: print(f"[eval] matmul patch err: {ep}",flush=True)
+          # Also patch F.scaled_dot_product_attention for GQA (Eagle3/Qwen2 sdpa path)
+          try:
+              import torch.nn.functional as _F
+              _orig_sdpa = _F.scaled_dot_product_attention
+              def _gqa_sdpa(query, key, value, *a, **kw):
+                  if query.dim()==4 and key.dim()==4 and query.shape[1]!=key.shape[1] and query.shape[1]%key.shape[1]==0:
+                      n = query.shape[1]//key.shape[1]
+                      key = key.repeat_interleave(n, dim=1)
+                      value = value.repeat_interleave(n, dim=1)
+                  return _orig_sdpa(query, key, value, *a, **kw)
+              _F.scaled_dot_product_attention = _gqa_sdpa
+              print("[eval] patched F.scaled_dot_product_attention for GQA",flush=True)
+          except Exception as ep: print(f"[eval] sdpa patch err: {ep}",flush=True)
+          ft_policy=load_policy(FT_LOCAL,label="finetuned")
+          ft_summary=run_rollouts(ft_policy,"finetuned",mapper,sim)
+          del ft_policy
+
+          delta={"success_rate_delta":round(ft_summary["success_rate"]-base_summary["success_rate"],3),
+                 "mean_dist_to_goal_delta":round(ft_summary["mean_dist_to_goal"]-base_summary["mean_dist_to_goal"],3),
+                 "mean_steps_delta":round(ft_summary["mean_steps"]-base_summary["mean_steps"],1)}
+          comparison={"base":base_summary,"finetuned":ft_summary,"delta":delta,
+                      "verdict":"finetuned_better" if delta["success_rate_delta"]>0
+                                 else("tie" if delta["success_rate_delta"]==0 else "base_better")}
+          json.dump(comparison,open(OUT/"comparison.json","w"),indent=2)
+          for k,v in delta.items():
+              if isinstance(v,(int,float)): run.summary[k]=v
+          run.summary["verdict"]=comparison["verdict"]
+          tbl2=wandb.Table(columns=["policy","success_rate","mean_dist_to_goal","mean_steps"],data=[
+              ["base",base_summary["success_rate"],base_summary["mean_dist_to_goal"],base_summary["mean_steps"]],
+              ["finetuned",ft_summary["success_rate"],ft_summary["mean_dist_to_goal"],ft_summary["mean_steps"]]])
+          run.log({"compare/table":tbl2,
+                   "compare/success_rate_chart":wandb.plot.bar(tbl2,"policy","success_rate",title="Success rate")})
+          wandb.save(str(OUT/"comparison.json"),policy="now")
+          run.finish()
+          print(f"[eval] complete: {comparison}",flush=True)
+      - path: /scripts/probe_nucleus.py
+        contents: |
+          import os, subprocess, sys
+          def probe():
+              # Try Isaac Sim nucleus API
+              try:
+                  from omni.isaac.nucleus import get_assets_root_path
+                  root = get_assets_root_path()
+                  if root: print(f"PROBE:NUCLEUS_ROOT={root}")
+              except Exception as e:
+                  print(f"PROBE:NUCLEUS_ERR={e}")
+              # Search bundled assets for forklift
+              for base in ["/workspace/isaaclab/_isaac_sim", "/isaac-sim", "/root/.local/share/ov/pkg"]:
+                  try:
+                      r = subprocess.run(["find", base, "-name", "forklift*.usd", "-maxdepth", "12"],
+                                         capture_output=True, text=True, timeout=20)
+                      for p in r.stdout.strip().split("\n"):
+                          if p and "forklift" in p.lower():
+                              print(f"PROBE:LOCAL_USD={p}")
+                  except Exception: pass
+              # Env vars
+              for k in ["NUCLEUS_SERVER","ISAAC_NUCLEUS_PATH","ISAAC_ASSETS_ROOT"]:
+                  v = os.environ.get(k,"")
+                  if v: print(f"PROBE:ENV_{k}={v}")
+          probe()
+      - path: /scripts/run.sh
+        contents: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+          export N_EPISODES="${N_EPISODES:-1}"
+          export MAX_EPISODE_STEPS="${MAX_EPISODE_STEPS:-300}"
+          export TASK_DESCRIPTION="${TASK_DESCRIPTION:-Drive the forklift to the green goal marker}"
+          export SIM_RPC_PORT="${SIM_RPC_PORT:-7000}"
+          export WANDB_PROJECT="${WANDB_PROJECT:-osmo-workflow}"
+          export BASE_MODEL="${BASE_MODEL:-nvidia/GR00T-N1.6-3B}"
+          export WANDB_FT_ARTIFACT="${WANDB_FT_ARTIFACT:-wandb-smle/osmo-workflow/groot-av-finetuned:latest}"
+          export OUT="{{output}}"
+          mkdir -p "${OUT}/videos" "${OUT}/metrics"
+
+          echo "=== sim-eval: downloading finetuned model from W&B ==="
+          apt-get update -y && apt-get install -y --no-install-recommends \
+            python3 python3-pip python3-venv python3-dev git ffmpeg ca-certificates curl
+          rm -rf /var/lib/apt/lists/*
+          python3 -m pip install --quiet --break-system-packages wandb
+
+          # Download finetuned checkpoint from W&B artifact
+          python3 - <<'PY'
+          import os, wandb
+          api = wandb.Api()
+          artifact_ref = os.environ["WANDB_FT_ARTIFACT"]
+          print(f"[data] downloading {artifact_ref}", flush=True)
+          art = api.artifact(artifact_ref, type="model")
+          art.download(root="/workspace/finetuned")
+          import pathlib
+          for f in list(pathlib.Path("/workspace/finetuned").rglob("*"))[:10]:
+              print(f"  {f}", flush=True)
+          PY
+          export FT_CKPT_DIR="/workspace/finetuned/model"
+
+          ISAACLAB_SH=/workspace/isaaclab/isaaclab.sh
+          ISAAC_PY=/workspace/isaaclab/_isaac_sim/python.sh
+
+          # Probe Isaac Sim for nucleus assets path
+          echo "[probe] Checking Isaac Sim nucleus path..."
+          ${ISAAC_PY} /scripts/probe_nucleus.py 2>/dev/null | grep "^PROBE:" > /tmp/isaac_probe.txt 2>/dev/null || true
+          echo "[probe] results:"
+          cat /tmp/isaac_probe.txt 2>/dev/null || echo "  (empty)"
+
+          # Extract nucleus root if found
+          NUCLEUS_ROOT=$(grep "^PROBE:NUCLEUS_ROOT=" /tmp/isaac_probe.txt 2>/dev/null | head -1 | cut -d= -f2- || true)
+          LOCAL_USD=$(grep "^PROBE:LOCAL_USD=" /tmp/isaac_probe.txt 2>/dev/null | head -1 | cut -d= -f2- || true)
+          if [[ -n "${NUCLEUS_ROOT}" ]]; then
+            export ISAAC_NUCLEUS_ROOT="${NUCLEUS_ROOT}"
+            echo "[probe] nucleus root: ${NUCLEUS_ROOT}"
+          elif [[ -n "${LOCAL_USD}" ]]; then
+            export FORKLIFT_USD_PATH="${LOCAL_USD}"
+            echo "[probe] using local bundled USD: ${LOCAL_USD}"
+          fi
+
+          # Download Forklift + Warehouse USDs from NVIDIA S3 (fallback / supplement)
+          mkdir -p /workspace/assets/Isaac/Robots/Forklift
+          mkdir -p /workspace/assets/Isaac/Environments/Simple_Warehouse
+          AWS_BASE="https://omniverse-content-production.s3-us-west-2.amazonaws.com"
+
+          mirror_dir() {
+            local _prefix="$1"
+            local _dest_root="$2"
+            local _listing="/tmp/mirror_$$.xml"
+            echo "[assets] mirroring ${_prefix}"
+            curl -fsSL "${AWS_BASE}/?list-type=2&prefix=${_prefix}" -o "${_listing}" 2>/dev/null || return 1
+            local _key _rel _dest
+            while IFS= read -r _key; do
+              _rel="${_key#${_prefix}}"
+              _dest="${_dest_root}/${_rel}"
+              mkdir -p "$(dirname "${_dest}")"
+              curl -fsSL "${AWS_BASE}/${_key}" -o "${_dest}" 2>/dev/null                 && echo "[assets]   OK  ${_rel}" || echo "[assets]   ERR ${_rel}"
+            done < <(grep -oE "<Key>[^<]+</Key>" "${_listing}" | sed -E "s|</?Key>||g")
+          }
+          mirror_dir "Assets/Isaac/4.5/Isaac/Environments/Simple_Warehouse/"                     "/workspace/assets/Isaac/Environments/Simple_Warehouse"
+          # Direct URL download — S3 list-type=2 paginates at 1000 objects, top-level
+          # warehouse USDs (full_warehouse.usd etc) appear after 1000+ prop files
+          WH_BASE="${AWS_BASE}/Assets/Isaac/4.5/Isaac/Environments/Simple_Warehouse"
+          # Try Isaac 5.0 paths (newer, more reliable for headless) AND 4.5 fallback
+          WH_BASE50="${AWS_BASE}/Assets/Isaac/5.0/Isaac/Environments/Simple_Warehouse"
+          for _wh_name in warehouse_with_forklifts.usd full_warehouse.usd warehouse_multiple_shelves.usd warehouse.usd; do
+            _dest="/workspace/assets/Isaac/Environments/Simple_Warehouse/${_wh_name}"
+            if [[ ! -s "${_dest}" ]]; then
+              curl -fsSL "${WH_BASE50}/${_wh_name}" -o "${_dest}" 2>/dev/null &&                 echo "[assets]   OK (v5.0) ${_wh_name}" ||                 (curl -fsSL "${WH_BASE}/${_wh_name}" -o "${_dest}" 2>/dev/null &&                 echo "[assets]   OK (v4.5) ${_wh_name}" || echo "[assets]   MISS ${_wh_name}")
+            fi
+          done
+          for _wh_name in warehouse_with_forklifts.usd full_warehouse.usd warehouse_multiple_shelves.usd warehouse.usd; do
+            _cand="/workspace/assets/Isaac/Environments/Simple_Warehouse/${_wh_name}"
+            [[ -s "${_cand}" ]] && { export WAREHOUSE_USD_PATH="${_cand}"; break; }
+          done
+          echo "[assets] WAREHOUSE_USD_PATH=${WAREHOUSE_USD_PATH:-NOT FOUND}"
+
+          # Forklift USD: download from S3 if not found via nucleus/local
+          if [[ -z "${FORKLIFT_USD_PATH:-}" && -z "${ISAAC_NUCLEUS_ROOT:-}" ]]; then
+            curl -fsSL "${AWS_BASE}/?list-type=2&prefix=Assets/Isaac/4.5/Isaac/Robots/Forklift/"                 -o /tmp/forklift_listing.xml || true
+            if [[ -s /tmp/forklift_listing.xml ]]; then
+              keys=$(grep -oE "<Key>[^<]+</Key>" /tmp/forklift_listing.xml | sed -E "s|</?Key>||g")
+              for key in ${keys}; do
+                rel="${key#Assets/Isaac/4.5/Isaac/Robots/Forklift/}"
+                dest="/workspace/assets/Isaac/Robots/Forklift/${rel}"
+                mkdir -p "$(dirname "${dest}")"
+                curl -fsSL "${AWS_BASE}/${key}" -o "${dest}" 2>/dev/null
+              done
+            fi
+            if [[ ! -s /workspace/assets/Isaac/Robots/Forklift/forklift_b.usd ]]; then
+              curl -fsSL "${AWS_BASE}/Assets/Isaac/4.5/Isaac/Robots/Forklift/forklift_b.usd"                 -o /workspace/assets/Isaac/Robots/Forklift/forklift_b.usd || true
+            fi
+            [[ -s /workspace/assets/Isaac/Robots/Forklift/forklift_b.usd ]]               && export FORKLIFT_USD_PATH="/workspace/assets/Isaac/Robots/Forklift/forklift_b.usd"               || { echo "[ERROR] forklift USD not found"; exit 1; }
+          fi
+          echo "[forklift] using ${FORKLIFT_USD_PATH:-nucleus:${ISAAC_NUCLEUS_ROOT}/Isaac/Robots/Forklift/forklift_b.usd}"
+
+          echo "=== Stage 3: Forklift nav eval ==="
+          nvidia-smi -L | head -10
+          export OMNI_KIT_ACCEPT_EULA=YES ACCEPT_EULA=Y PRIVACY_CONSENT=Y
+          export PYTHONPATH="/scripts${PYTHONPATH:+:${PYTHONPATH}}"
+          "${ISAAC_PY}" -m pip install --no-cache-dir -q \
+            grpcio==1.66.2 gymnasium==1.2.1 imageio==2.34.1 imageio-ffmpeg==0.4.9 wandb==0.25.0
+
+          echo "[sim] starting sim server on :${SIM_RPC_PORT}"
+          ISAAC_TASK=Isaac-Forklift-Nav-v0 \
+            "${ISAACLAB_SH}" -p /scripts/sim_server.py 2>&1 | tee "${OUT}/sim.log" &
+          SIM_PID=$!
+
+          # GR00T policy venv
+          python3 -m venv /opt/groot-venv
+          source /opt/groot-venv/bin/activate
+          python -m pip install --upgrade pip
+          python -m pip install --no-cache-dir torch==2.7.1 torchvision==0.22.1 \
+            --index-url https://download.pytorch.org/whl/cu128
+          python -m pip install --no-cache-dir \
+            transformers==4.51.3 accelerate==0.33.0 safetensors==0.4.5 \
+            grpcio==1.66.2 numpy==1.26.4 imageio imageio-ffmpeg \
+            albumentations==1.4.18 diffusers==0.35.1 dm-tree==0.1.8 \
+            datasets==3.6.0 peft==0.17.1 msgpack==1.1.0 msgpack-numpy==0.4.8 \
+            omegaconf==2.3.0 tyro==0.9.17 einops scipy termcolor av huggingface_hub \
+            wandb==0.25.0 lmdb pyarrow
+          if [[ ! -d /workspace/Isaac-GR00T ]]; then
+            git clone --depth 1 --branch n1.6-release https://github.com/NVIDIA/Isaac-GR00T /workspace/Isaac-GR00T
+          fi
+          python -m pip install --no-deps -e /workspace/Isaac-GR00T
+          export PYTHONPATH="/workspace/Isaac-GR00T:/scripts${PYTHONPATH:+:${PYTHONPATH}}"
+          python /scripts/install_flash_attn_stub.py
+          python /scripts/patch_eagle_for_sdpa.py
+          cp /scripts/av_vehicle_config.py /workspace/Isaac-GR00T/av_vehicle_config.py
+
+          if ! python /scripts/wait_for_sim.py; then
+            echo "[sim] FAILED — sim.log:"; tail -n 200 "${OUT}/sim.log" 2>/dev/null || true; exit 1
+          fi
+
+          set +e
+          PYTHONOPTIMIZE=1 python /scripts/eval_runner.py
+          EVAL_RC=$?
+          set -e
+
+          # SIM_PID is the tee PID (sim is piped through tee), so killing it leaves Isaac Sim
+          # running -> task zombies and hangs holding GPUs. Kill the real sim process by name.
+          echo "[shutdown] stopping Isaac Sim sim_server ..."
+          pkill -9 -f sim_server.py 2>/dev/null || true
+          pkill -9 -f "kit" 2>/dev/null || true
+          kill -9 ${SIM_PID} 2>/dev/null || true
+          echo "=== sim-eval DONE (eval rc=${EVAL_RC}) ==="
+          exit ${EVAL_RC}

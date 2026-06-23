@@ -1,0 +1,282 @@
+version: 2
+# cosmos-cap.yaml — Cosmos3-Nano (Reasoner) video captioning + quality curation
+#
+# Consumes a GR00T-compliant LeRobot v2.1 dataset (av-forklift-v1). For each episode:
+# caption the clip with the Cosmos3-Nano Reasoner + score plausibility (1-5). Episodes
+# scoring >= MIN_SCORE are kept; each kept episode gets a UNIQUE task_index whose tasks.jsonl
+# entry is the generated caption (per-episode language), and the dataset is renumbered 0..K-1
+# so it stays GR00T-compliant.
+#
+# Serve: vllm serve nvidia/Cosmos3-Nano --hf-overrides Cosmos3ReasonerForConditionalGeneration
+#        --media-io-kwargs '{"video":{"num_frames":-1}}' (cu128 for Blackwell; vllm 0.19.1 + vllm-cosmos3)
+# Safe fallback: if the Reasoner can't load, keep the existing per-episode captions.
+#
+# Input  artifact: av-forklift-v1
+# Output artifact: av-cosmos-cap-v1
+# Smoke: osmo workflow submit cosmos-cap.yaml --pool default --set-env MAX_EPISODES=3
+
+workflow:
+  name: cosmos-cap
+  resources:
+    cap-gpu:
+      platform: gpu
+      gpu: 2
+      cpu: 32
+      memory: 128Gi
+      storage: 200Gi
+
+  groups:
+  - name: cap-group
+    tasks:
+    - name: cosmos-cap
+      lead: true
+      resource: cap-gpu
+      image: nvcr.io/nvidia/pytorch:25.05-py3
+      command: [bash]
+      args: [/scripts/run.sh]
+      credentials:
+        workflow-secrets:
+          HF_TOKEN: HF_TOKEN
+          WANDB_API_KEY: WANDB_API_KEY
+          WANDB_ENTITY: WANDB_ENTITY
+      files:
+
+      - path: /scripts/cap.py
+        contents: |
+          """Cosmos3-Nano Reasoner captioning over a GR00T LeRobot v2.1 dataset.
+
+          Reads per-episode parquets + mp4s, captions each clip, filters by score, then
+          re-emits a GR00T-compliant dataset where each kept episode's caption is its own
+          task (unique task_index). Renumbers episodes/tasks 0..K-1.
+          """
+          import os, sys, io, json, time, re, shutil
+          from pathlib import Path
+          import numpy as np
+          import pandas as pd
+          import wandb
+
+          IN_DIR     = Path(os.environ["IN_DIR"])
+          OUT_DIR    = Path(os.environ["OUT_DIR"])
+          REASON_URL = os.environ.get("REASON_URL", "http://127.0.0.1:8000")
+          MIN_SCORE  = int(os.environ.get("MIN_SCORE", "3"))
+          MAX_EPISODES = int(os.environ.get("MAX_EPISODES", "0"))
+
+          PROMPT = (
+              "You are analyzing a first-person forklift operation video clip in a warehouse.\n"
+              "Respond in EXACTLY this format, nothing else:\n"
+              "DESCRIPTION: <one sentence, max 20 words, describing the specific forklift action>\n"
+              "PHASE: <one of: navigate | align | insert | lift | deliver>\n"
+              "SCORE: <integer 1-5, where 5=physically realistic smooth motion, 3=acceptable, 1=reject>\n"
+              "REASONING: <one short sentence>\n"
+          )
+
+          def parse_response(text):
+              o = {"description": None, "phase": None, "score": None}
+              for ln in text.strip().splitlines():
+                  u = ln.strip()
+                  if u.upper().startswith("DESCRIPTION:"): o["description"] = u.split(":", 1)[1].strip()
+                  elif u.upper().startswith("PHASE:"):      o["phase"] = u.split(":", 1)[1].strip().lower()
+                  elif u.upper().startswith("SCORE:"):
+                      m = re.search(r"[1-5]", u.split(":", 1)[1]); o["score"] = int(m.group()) if m else None
+              return o
+
+          # ---- connect to Reasoner ----
+          use_reasoner, client, model_id = False, None, None
+          try:
+              import openai
+              client = openai.OpenAI(api_key="EMPTY", base_url=f"{REASON_URL}/v1")
+              model_id = client.models.list().data[0].id
+              use_reasoner = True
+              print(f"[cap] Reasoner online: {model_id}", flush=True)
+          except Exception as e:
+              print(f"[cap] Reasoner NOT available ({e}); fallback to existing captions", flush=True)
+
+          def caption_video(mp4):
+              try:
+                  resp = client.chat.completions.create(model=model_id, max_tokens=256, temperature=0.2, seed=0,
+                      messages=[{"role": "user", "content": [
+                          {"type": "video_url", "video_url": {"url": mp4.resolve().as_uri()}},
+                          {"type": "text", "text": PROMPT}]}])
+                  return parse_response(resp.choices[0].message.content)
+              except Exception as e:
+                  print(f"[cap] call failed {mp4.name}: {e}", flush=True); return None
+
+          # ---- load source GR00T dataset meta ----
+          src_meta = IN_DIR / "meta"
+          info = json.loads((src_meta / "info.json").read_text())
+          modality = json.loads((src_meta / "modality.json").read_text())
+          episodes_meta = [json.loads(l) for l in (src_meta / "episodes.jsonl").read_text().splitlines() if l.strip()]
+          action_contract = json.loads((IN_DIR / "action_contract.json").read_text()) if (IN_DIR / "action_contract.json").exists() else {}
+          ep_lang = {e["episode_index"]: (e.get("tasks", [""]) or [""])[0] for e in episodes_meta}
+          ep_ids = sorted(e["episode_index"] for e in episodes_meta)
+          if MAX_EPISODES > 0:
+              ep_ids = ep_ids[:MAX_EPISODES]
+              print(f"[cap] SMOKE: capped to first {MAX_EPISODES} episodes", flush=True)
+          print(f"[cap] {len(ep_ids)} episodes", flush=True)
+
+          src_data = IN_DIR / "data" / "chunk-000"
+          src_vid  = IN_DIR / "videos" / "chunk-000" / "observation.images.front_camera"
+
+          run = wandb.init(entity=os.environ.get("WANDB_ENTITY"),
+              project=os.environ.get("WANDB_PROJECT", "osmo-workflow"),
+              name=f"cosmos-cap-{time.strftime('%m%d-%H%M')}",
+              job_type="cosmos-cap", tags=["cosmos-cap", "cosmos3", "reasoner"],
+              config={"use_reasoner": use_reasoner, "min_score": MIN_SCORE, "n_input": len(ep_ids),
+                      "source_artifact": os.environ.get("WANDB_INPUT_ARTIFACT", "")})
+
+          # record the upstream dataset as a W&B input so the lineage edge shows (av-forklift-v1 -> cosmos-cap)
+          try:
+              run.use_artifact(os.environ.get("WANDB_INPUT_ARTIFACT") or "av-forklift-v1:latest", type="dataset")
+          except Exception as _e:
+              print(f"[cap] use_artifact lineage note: {_e}", flush=True)
+
+          # ---- caption + score each episode ----
+          records, kept = [], []   # kept: list of (src_ep, caption)
+          for ep in ep_ids:
+              mp4 = src_vid / f"episode_{ep:06d}.mp4"
+              caption = ep_lang.get(ep, "operate the forklift"); score = 4
+              if use_reasoner and mp4.exists():
+                  r = caption_video(mp4)
+                  if r and r["score"] is not None:
+                      score = r["score"]; caption = r["description"] or caption
+                      print(f"[cap] ep {ep}: score={score} | {caption[:60]}", flush=True)
+              keep = score >= MIN_SCORE
+              records.append({"src_episode": int(ep), "score": score, "caption": caption, "kept": keep})
+              if keep: kept.append((ep, caption))
+
+          if not kept:
+              print(f"[cap] WARN: all filtered (min={MIN_SCORE}); keeping all", flush=True)
+              kept = [(ep, ep_lang.get(ep, "operate the forklift")) for ep in ep_ids]
+              for r in records: r["kept"] = True
+
+          # ---- re-emit GR00T-compliant dataset, renumbered 0..K-1, per-episode tasks ----
+          out_data = OUT_DIR / "data" / "chunk-000"; out_data.mkdir(parents=True, exist_ok=True)
+          out_vid  = OUT_DIR / "videos" / "chunk-000" / "observation.images.front_camera"; out_vid.mkdir(parents=True, exist_ok=True)
+          out_meta = OUT_DIR / "meta"; out_meta.mkdir(parents=True, exist_ok=True)
+
+          new_tasks, new_eps = [], []
+          gi, total_frames = 0, 0
+          all_state, all_action = [], []
+          for new_idx, (src_ep, caption) in enumerate(kept):
+              dfp = pd.read_parquet(src_data / f"episode_{src_ep:06d}.parquet")
+              n = len(dfp)
+              dfp["episode_index"] = np.int64(new_idx)
+              dfp["task_index"] = np.int64(new_idx)
+              dfp["index"] = np.arange(gi, gi + n, dtype=np.int64)
+              gi += n; total_frames += n
+              dfp.to_parquet(str(out_data / f"episode_{new_idx:06d}.parquet"), index=False)
+              shutil.copy2(str(src_vid / f"episode_{src_ep:06d}.mp4"), str(out_vid / f"episode_{new_idx:06d}.mp4"))
+              new_tasks.append({"task_index": new_idx, "task": caption})
+              new_eps.append({"episode_index": new_idx, "tasks": [caption], "length": n})
+              all_state.append(np.stack(dfp["observation.state"].apply(lambda x: np.asarray(x, np.float32)).values))
+              all_action.append(np.stack(dfp["action"].apply(lambda x: np.asarray(x, np.float32)).values))
+
+          K = len(kept)
+          info["total_episodes"] = K; info["total_frames"] = total_frames
+          info["total_tasks"] = K; info["total_videos"] = K; info["splits"] = {"train": f"0:{K}"}
+          (out_meta / "info.json").write_text(json.dumps(info, indent=2))
+          (out_meta / "tasks.jsonl").write_text("\n".join(json.dumps(t) for t in new_tasks))
+          (out_meta / "episodes.jsonl").write_text("\n".join(json.dumps(e) for e in new_eps))
+          (out_meta / "modality.json").write_text(json.dumps(modality, indent=2))
+          if action_contract: (OUT_DIR / "action_contract.json").write_text(json.dumps(action_contract, indent=2))
+
+          state_arr = np.concatenate(all_state); action_arr = np.concatenate(all_action)
+          def fs(a): return {"mean": a.mean(0).tolist(), "std": (a.std(0)+1e-8).tolist(),
+              "min": a.min(0).tolist(), "max": a.max(0).tolist(),
+              "q01": np.quantile(a,0.01,0).tolist(), "q99": np.quantile(a,0.99,0).tolist()}
+          src_stats = json.loads((src_meta/"stats.json").read_text()) if (src_meta/"stats.json").exists() else {}
+          stats = {"observation.state": fs(state_arr), "action": fs(action_arr)}
+          if "observation.images.front_camera" in src_stats:
+              stats["observation.images.front_camera"] = src_stats["observation.images.front_camera"]
+          (out_meta / "stats.json").write_text(json.dumps(stats, indent=2))
+          (out_meta / "caption_records.jsonl").write_text("\n".join(json.dumps(r) for r in records))
+
+          # ---- validation + W&B ----
+          scores = [r["score"] for r in records]
+          n_pq = len(list(out_data.glob("*.parquet"))); n_mp4 = len(list(out_vid.glob("*.mp4")))
+          print("\n==== VALIDATION ====", flush=True)
+          print(f"  use_reasoner:  {use_reasoner} | {'PASS' if use_reasoner else 'FALLBACK'}", flush=True)
+          print(f"  kept:          {K}/{len(ep_ids)} | parquets={n_pq} mp4s={n_mp4} | {'PASS' if K==n_pq==n_mp4 else 'FAIL'}", flush=True)
+          print(f"  mean score:    {round(float(np.mean(scores)),2)}", flush=True)
+          print(f"  unique tasks:  {len(new_tasks)} (per-episode captions)", flush=True)
+          print("====================\n", flush=True)
+
+          tbl = wandb.Table(columns=["src_episode","score","caption","kept"],
+              data=[[r["src_episode"], r["score"], r["caption"][:70], r["kept"]] for r in records])
+          run.log({"caption_quality_table": tbl})
+          run.summary.update({"n_input": len(ep_ids), "n_output": K, "n_filtered": len(ep_ids)-K,
+              "mean_score": round(float(np.mean(scores)),2), "use_reasoner": use_reasoner})
+
+          art = wandb.Artifact("av-cosmos-cap-v1", type="dataset",
+              description=f"Cosmos3-Nano Reasoner captioned forklift dataset ({K} eps, GR00T v2.1)",
+              metadata={"n_episodes": K, "source": "av-forklift-v1", "use_reasoner": use_reasoner})
+          art.add_dir(str(OUT_DIR), name="dataset")
+          run.log_artifact(art).wait()
+          run.finish()
+          print(f"[cap] Done — av-cosmos-cap-v1 ({K} eps, reasoner={use_reasoner})", flush=True)
+
+      - path: /scripts/run.sh
+        contents: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+          export WANDB_PROJECT="${WANDB_PROJECT:-osmo-workflow}"
+          export WANDB_INPUT_ARTIFACT="${WANDB_INPUT_ARTIFACT:-wandb-smle/osmo-workflow/av-forklift-v1:latest}"
+          export MIN_SCORE="${MIN_SCORE:-3}"
+          export MAX_EPISODES="${MAX_EPISODES:-0}"
+          export REASON_PORT="${REASON_PORT:-8000}"
+          export REASON_URL="http://127.0.0.1:${REASON_PORT}"
+          export COSMOS_MODEL="${COSMOS_MODEL:-nvidia/Cosmos3-Nano}"
+          export IN_DIR="/workspace/forklift_dataset/dataset"
+          export OUT_DIR="{{output}}/dataset"
+          mkdir -p "/workspace/forklift_dataset" "${OUT_DIR}"
+
+          echo "=== cosmos-cap: Cosmos3-Nano Reasoner captioning ==="
+          nvidia-smi -L | head -4
+          apt-get update -y >/dev/null 2>&1 || true
+          apt-get install -y --no-install-recommends git ffmpeg ca-certificates curl >/dev/null 2>&1 || true
+
+          if [[ -n "${HF_TOKEN:-}" ]]; then
+            pip install --quiet --no-cache-dir huggingface_hub 2>&1 | tail -1 || true
+            python3 -c "from huggingface_hub import login; login('${HF_TOKEN}')" 2>/dev/null && echo "[hf] logged in" || true
+          fi
+
+          # fresh uv venv for vLLM Reasoner (cu128 for Blackwell sm_120)
+          echo "[vllm] installing uv + vllm + vllm-cosmos3 ..."
+          pip install --quiet --no-cache-dir uv 2>&1 | tail -1 || true
+          export VENV=/opt/cosmos-venv
+          uv venv --python 3.13 --seed "${VENV}"
+          source "${VENV}/bin/activate"
+          uv pip install --torch-backend=cu128 "vllm==0.19.1" \
+            "vllm-cosmos3 @ git+https://github.com/NVIDIA/cosmos-framework.git#subdirectory=packages/vllm-cosmos3" \
+            openai pandas pyarrow imageio imageio-ffmpeg Pillow "wandb==0.25.0" huggingface_hub 2>&1 | tail -15
+
+          echo "[vllm] starting Cosmos3-Nano Reasoner on :${REASON_PORT} ..."
+          CUDA_VISIBLE_DEVICES=0 HF_HUB_ENABLE_HF_TRANSFER=1 \
+          vllm serve "${COSMOS_MODEL}" \
+            --hf-overrides '{"architectures": ["Cosmos3ReasonerForConditionalGeneration"]}' \
+            --tensor-parallel-size 1 --mm-encoder-tp-mode data --async-scheduling \
+            --allowed-local-media-path / --media-io-kwargs '{"video": {"num_frames": -1}}' \
+            --port "${REASON_PORT}" > /workspace/vllm_server.log 2>&1 &
+          VLLM_PID=$!
+          echo "[vllm] PID=${VLLM_PID}; waiting for readiness ..."
+          READY=0
+          for i in $(seq 1 240); do
+            if curl -sf "http://127.0.0.1:${REASON_PORT}/v1/models" >/dev/null 2>&1; then
+              echo "[vllm] ready after ~$((i*10))s"; READY=1; break; fi
+            if ! kill -0 ${VLLM_PID} 2>/dev/null; then echo "[vllm] died:"; tail -n 40 /workspace/vllm_server.log; break; fi
+            sleep 10
+          done
+          [[ "${READY}" != "1" ]] && { echo "[vllm] NOT ready -> fallback captions"; tail -n 20 /workspace/vllm_server.log 2>/dev/null || true; }
+
+          echo "[data] downloading ${WANDB_INPUT_ARTIFACT} ..."
+          python - <<'PY'
+          import os, wandb
+          api = wandb.Api()
+          api.artifact(os.environ["WANDB_INPUT_ARTIFACT"], type="dataset").download(root="/workspace/forklift_dataset")
+          print("[data] download complete")
+          PY
+
+          echo "[cap] running captioning (MAX_EPISODES=${MAX_EPISODES}, MIN_SCORE=${MIN_SCORE}) ..."
+          python /scripts/cap.py 2>&1 | tee "{{output}}/cap.log"
+          kill ${VLLM_PID} 2>/dev/null || true
+          echo "=== cosmos-cap DONE ==="

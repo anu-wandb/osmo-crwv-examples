@@ -1,0 +1,269 @@
+version: 2
+# dataset-preprocess.yaml — Convert tduggan93/forklift -> GR00T-compliant LeRobot v2.1
+#
+# Produces the exact schema GR00T N1.6 LeRobotSingleDataset requires (verified against
+# NVIDIA/Isaac-GR00T demo_data/droid_sample):
+#   data/chunk-000/episode_{i:06d}.parquet   (ONE per episode; cols: observation.state,
+#                                              action, timestamp, frame_index, episode_index,
+#                                              index, task_index — NO image col)
+#   videos/chunk-000/observation.images.front_camera/episode_{i:06d}.mp4   (448x448, dtype video)
+#   meta/info.json      (codebase_version v2.1 + features + data_path/video_path/chunks_size/splits)
+#   meta/tasks.jsonl    ({task_index, task})
+#   meta/episodes.jsonl ({episode_index, tasks, length})
+#   meta/modality.json  (state.vehicle_state[0:9], action.vehicle_control[0:3],
+#                        video.front_camera, annotation.human.task_description<-task_index)
+#   meta/stats.json     (observation.state, action, image stats for normalization)
+#   action_contract.json
+#
+# Action map (5D src -> 3D): [steer<-src1, throttle<-src0(drive), lift<-src2]; drop shift/tilt
+# State (9D): 6 joint dims + 3 pallet_delta
+#
+# Output artifact: av-forklift-v1
+# Submit: osmo workflow submit dataset-preprocess.yaml --pool default
+
+workflow:
+  name: dataset-preprocess
+  resources:
+    preprocess-gpu:
+      platform: gpu
+      gpu: 0
+      cpu: 16
+      memory: 64Gi
+      storage: 50Gi
+
+  groups:
+  - name: preprocess-group
+    tasks:
+    - name: preprocess
+      lead: true
+      resource: preprocess-gpu
+      image: nvcr.io/nvidia/pytorch:25.05-py3
+      command: [bash]
+      args: [/scripts/run.sh]
+      credentials:
+        workflow-secrets:
+          WANDB_API_KEY: WANDB_API_KEY
+          WANDB_ENTITY: WANDB_ENTITY
+      files:
+
+      - path: /scripts/preprocess.py
+        contents: |
+          """Convert tduggan93/forklift -> GR00T-compliant LeRobot v2.1 dataset."""
+          import os, sys, io, json, time
+          from pathlib import Path
+          import numpy as np
+          import pandas as pd
+          from PIL import Image
+          import imageio
+          import wandb
+          from huggingface_hub import snapshot_download
+
+          OUT_DIR = Path(os.environ["OUT_DIR"])
+          FPS     = int(os.environ.get("FPS_OUT", "10"))
+          H = int(os.environ.get("HEIGHT", "448")); W = int(os.environ.get("WIDTH", "448"))
+          DATASET = os.environ.get("HF_DATASET", "tduggan93/forklift")
+          CHUNK = 1000
+
+          TASK_LANG = {
+              0: "engage the forklift forks under the pallet on the ground",
+              1: "place the loaded pallet into the slot on the ground",
+              2: "place the loaded pallet into the slot on the truck",
+              3: "engage the forklift forks under the pallet on the truck",
+          }
+          ACTION_CONTRACT = {"ACTION_STEER": 0, "ACTION_THROTTLE": 1, "ACTION_LIFT": 2, "dim": 3,
+              "ranges": {"steer": [-0.43, 0.43], "throttle": [-0.40, 0.60], "lift": [0.0, 0.239]},
+              "source_dataset": DATASET,
+              "map": ["steer<-src[1]", "throttle<-src[0]/drive", "lift<-src[2]"],
+              "dropped": ["shift=src[3]", "tilt=src[4]"]}
+
+          STATE_NAMES = ["lift_joint","shift_joint","steering_angle","steering_rate",
+                         "wheel_velocity","tilt_angle","pallet_dx","pallet_dy","pallet_dyaw"]
+
+          def decode_image(x):
+              if isinstance(x, dict): x = x.get("bytes") or x.get("path")
+              if isinstance(x, (bytes, bytearray)): return Image.open(io.BytesIO(bytes(x))).convert("RGB")
+              if isinstance(x, np.ndarray): return Image.fromarray(x.astype(np.uint8))
+              return Image.open(x).convert("RGB")
+          def map_action(src):  return [float(src[1]), float(src[0]), float(src[2])]   # steer, throttle, lift
+          def build_state(st, pdelta): return [float(v) for v in st] + [float(v) for v in pdelta]
+
+          print(f"[pre] downloading {DATASET} ...", flush=True)
+          t0 = time.time()
+          repo = Path(snapshot_download(repo_id=DATASET, repo_type="dataset"))
+          pfs = sorted(repo.rglob("*.parquet"))
+          df = pd.concat([pd.read_parquet(p) for p in pfs], ignore_index=True)
+          print(f"[pre] {len(df)} rows; cols={list(df.columns)} ({time.time()-t0:.1f}s)", flush=True)
+          img_col = next(c for c in df.columns if "image" in c.lower())
+          act_col = next(c for c in df.columns if "action" in c.lower())
+          st_col  = next(c for c in df.columns if c == "state")
+          pd_col  = next(c for c in df.columns if "pallet" in c.lower() and "valid" not in c.lower())
+          ti_col  = next(c for c in df.columns if "task" in c.lower())
+          ep_col  = next(c for c in df.columns if "episode" in c.lower())
+          fr_col  = next(c for c in df.columns if "frame" in c.lower())
+
+          data_dir = OUT_DIR / "data" / "chunk-000"; data_dir.mkdir(parents=True, exist_ok=True)
+          vid_dir  = OUT_DIR / "videos" / "chunk-000" / "observation.images.front_camera"; vid_dir.mkdir(parents=True, exist_ok=True)
+          meta_dir = OUT_DIR / "meta"; meta_dir.mkdir(parents=True, exist_ok=True)
+
+          run = wandb.init(entity=os.environ.get("WANDB_ENTITY"),
+              project=os.environ.get("WANDB_PROJECT", "osmo-workflow"),
+              name=f"dataset-preprocess-{time.strftime('%m%d-%H%M')}",
+              job_type="dataset-preprocess", tags=["dataset-preprocess", "forklift", "lerobot-v2.1"],
+              config={"source": DATASET, "fps": FPS, "resolution": f"{H}x{W}"})
+
+          episodes = {int(e): g.sort_values(fr_col).reset_index(drop=True) for e, g in df.groupby(ep_col)}
+          ep_ids = sorted(episodes)
+          print(f"[pre] {len(ep_ids)} episodes", flush=True)
+
+          global_index = 0
+          total_frames = 0
+          episodes_meta = []
+          task_counts = {0: 0, 1: 0, 2: 0, 3: 0}
+          all_state, all_action = [], []
+          img_samples = []
+          sample_logged = set()
+
+          for ep in ep_ids:
+              g = episodes[ep]
+              task_idx = int(g.iloc[0][ti_col]); task_counts[task_idx] = task_counts.get(task_idx, 0) + 1
+              frames, rows = [], []
+              for fi in range(len(g)):
+                  row = g.iloc[fi]
+                  arr = np.array(decode_image(row[img_col]).resize((W, H), Image.LANCZOS))
+                  frames.append(arr)
+                  if global_index % 50 == 0: img_samples.append(arr)
+                  state = build_state(list(row[st_col]), list(row[pd_col]))
+                  action = map_action(row[act_col])
+                  all_state.append(state); all_action.append(action)
+                  rows.append({"observation.state": np.asarray(state, dtype=np.float32),
+                               "action": np.asarray(action, dtype=np.float32),
+                               "timestamp": np.float32(fi / FPS), "frame_index": np.int64(fi),
+                               "episode_index": np.int64(ep), "index": np.int64(global_index),
+                               "task_index": np.int64(task_idx)})
+                  global_index += 1
+              imageio.mimsave(str(vid_dir / f"episode_{ep:06d}.mp4"), frames, fps=FPS, quality=8)
+              pd.DataFrame(rows).to_parquet(str(data_dir / f"episode_{ep:06d}.parquet"), index=False)
+              episodes_meta.append({"episode_index": ep, "tasks": [TASK_LANG[task_idx]], "length": len(rows)})
+              total_frames += len(rows)
+              # log one sample video per task type
+              if task_idx not in sample_logged:
+                  run.log({f"sample_task_{task_idx}": wandb.Video(str(vid_dir / f"episode_{ep:06d}.mp4"),
+                           fps=FPS, format="mp4", caption=TASK_LANG[task_idx])})
+                  sample_logged.add(task_idx)
+              if ep % 25 == 0: print(f"[pre] ep {ep}/{len(ep_ids)} (task={task_idx}, {len(rows)} frames)", flush=True)
+
+          N = len(episodes_meta)
+          state_arr = np.asarray(all_state, dtype=np.float32)
+          action_arr = np.asarray(all_action, dtype=np.float32)
+
+          def feat_stats(a):
+              return {"mean": a.mean(0).tolist(), "std": (a.std(0) + 1e-8).tolist(),
+                      "min": a.min(0).tolist(), "max": a.max(0).tolist(),
+                      "q01": np.quantile(a, 0.01, 0).tolist(), "q99": np.quantile(a, 0.99, 0).tolist()}
+
+          # image stats (per channel, normalized 0-1) from subsample
+          imgs = np.stack(img_samples).astype(np.float32) / 255.0   # (n,H,W,3)
+          img_mean = imgs.mean(axis=(0,1,2)).tolist(); img_std = (imgs.std(axis=(0,1,2)) + 1e-8).tolist()
+          def chan(v): return [[[c]] for c in v]   # shape (3,1,1) per LeRobot image-stats convention
+
+          # ---- meta/info.json ----
+          info = {
+              "codebase_version": "v2.1", "robot_type": "forklift",
+              "total_episodes": N, "total_frames": total_frames,
+              "total_tasks": len(TASK_LANG), "total_videos": N, "total_chunks": 1, "chunks_size": CHUNK,
+              "fps": FPS, "splits": {"train": f"0:{N}"},
+              "data_path": "data/chunk-{episode_chunk:03d}/episode_{episode_index:06d}.parquet",
+              "video_path": "videos/chunk-{episode_chunk:03d}/{video_key}/episode_{episode_index:06d}.mp4",
+              "features": {
+                  "observation.images.front_camera": {"dtype": "video", "shape": [H, W, 3],
+                      "names": ["height", "width", "channel"],
+                      "info": {"video.fps": float(FPS), "video.codec": "h264",
+                               "video.height": H, "video.width": W, "video.channels": 3}},
+                  "observation.state": {"dtype": "float32", "shape": [9], "names": STATE_NAMES},
+                  "action": {"dtype": "float32", "shape": [3], "names": ["steer", "throttle", "lift"]},
+                  "timestamp": {"dtype": "float32", "shape": [1]},
+                  "frame_index": {"dtype": "int64", "shape": [1]},
+                  "episode_index": {"dtype": "int64", "shape": [1]},
+                  "index": {"dtype": "int64", "shape": [1]},
+                  "task_index": {"dtype": "int64", "shape": [1]},
+              },
+          }
+          (meta_dir / "info.json").write_text(json.dumps(info, indent=2))
+
+          # ---- meta/tasks.jsonl ----
+          (meta_dir / "tasks.jsonl").write_text(
+              "\n".join(json.dumps({"task_index": k, "task": v}) for k, v in sorted(TASK_LANG.items())))
+          # ---- meta/episodes.jsonl ----
+          (meta_dir / "episodes.jsonl").write_text(
+              "\n".join(json.dumps(e) for e in episodes_meta))
+          # ---- meta/modality.json ----
+          (meta_dir / "modality.json").write_text(json.dumps({
+              "state": {"vehicle_state": {"start": 0, "end": 9}},
+              "action": {"vehicle_control": {"start": 0, "end": 3}},
+              "video": {"front_camera": {"original_key": "observation.images.front_camera"}},
+              "annotation": {"human.task_description": {"original_key": "task_index"}},
+          }, indent=2))
+          # ---- meta/stats.json ----
+          (meta_dir / "stats.json").write_text(json.dumps({
+              "observation.state": feat_stats(state_arr),
+              "action": feat_stats(action_arr),
+              "observation.images.front_camera": {"mean": chan(img_mean), "std": chan(img_std),
+                  "min": chan([0.0,0.0,0.0]), "max": chan([1.0,1.0,1.0])},
+          }, indent=2))
+          (OUT_DIR / "action_contract.json").write_text(json.dumps(ACTION_CONTRACT, indent=2))
+
+          # ---- validation ----
+          print("\n==== VALIDATION ====", flush=True)
+          th_std = float(action_arr[:, 1].std()); lift_frac = float((action_arr[:, 2] > 0.01).mean())
+          n_parquet = len(list(data_dir.glob("*.parquet"))); n_mp4 = len(list(vid_dir.glob("*.mp4")))
+          print(f"  episodes:        {N} | parquets={n_parquet} mp4s={n_mp4} | {'PASS' if N==n_parquet==n_mp4 else 'FAIL'}", flush=True)
+          print(f"  THROTTLE std:    {th_std:.4f} | >0.1 | {'PASS' if th_std>0.1 else 'FAIL'}", flush=True)
+          print(f"  LIFT frac:       {lift_frac:.4f} | >0.1 | {'PASS' if lift_frac>0.1 else 'FAIL'}", flush=True)
+          print(f"  state dim/action dim: {state_arr.shape[1]}/{action_arr.shape[1]} (expect 9/3)", flush=True)
+          print(f"  task_counts:     {task_counts}", flush=True)
+          print(f"  features keys:   {list(info['features'].keys())}", flush=True)
+          print("====================\n", flush=True)
+
+          run.summary.update({"n_episodes": N, "n_frames": total_frames,
+              "throttle_std": round(th_std, 4), "lift_frac_active": round(lift_frac, 4),
+              "task_counts": {f"task_{k}": v for k, v in task_counts.items()}})
+          tbl = wandb.Table(columns=["channel","mean","std","min","max"],
+              data=[[n, round(float(action_arr[:,i].mean()),4), round(float(action_arr[:,i].std()),4),
+                     round(float(action_arr[:,i].min()),4), round(float(action_arr[:,i].max()),4)]
+                    for i,n in enumerate(["steer","throttle","lift"])])
+          run.log({"action_channel_stats": tbl})
+
+          art = wandb.Artifact("av-forklift-v1", type="dataset",
+              description=f"tduggan93/forklift -> GR00T LeRobot v2.1 ({N} episodes)",
+              metadata={"source": DATASET, "n_episodes": N, "n_frames": total_frames,
+                        "format": "lerobot-v2.1", "action_dim": 3, "state_dim": 9})
+          art.add_dir(str(OUT_DIR), name="dataset")
+          run.log_artifact(art).wait()
+          run.finish()
+          print(f"[pre] Done in {time.time()-t0:.0f}s — artifact av-forklift-v1 ({N} eps, {total_frames} frames)", flush=True)
+
+      - path: /scripts/run.sh
+        contents: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+          export WANDB_PROJECT="${WANDB_PROJECT:-osmo-workflow}"
+          export HF_DATASET="${HF_DATASET:-tduggan93/forklift}"
+          export FPS_OUT="${FPS_OUT:-10}" HEIGHT="${HEIGHT:-448}" WIDTH="${WIDTH:-448}"
+          export OUT_DIR="{{output}}/dataset"
+          mkdir -p "${OUT_DIR}"
+
+          echo "=== dataset-preprocess: tduggan93/forklift -> GR00T LeRobot v2.1 ==="
+          python3 --version; nvidia-smi -L 2>/dev/null | head -2 || true
+
+          apt-get update -y >/dev/null 2>&1 || true
+          apt-get install -y --no-install-recommends git ffmpeg ca-certificates curl >/dev/null 2>&1 || true
+          pip install --no-cache-dir --quiet \
+            huggingface_hub pandas==2.2.3 pyarrow==17.0.0 \
+            Pillow imageio imageio-ffmpeg numpy wandb==0.25.0
+
+          python3 /scripts/preprocess.py 2>&1 | tee "{{output}}/preprocess.log"
+
+          echo "=== sanity: output tree ==="
+          find "${OUT_DIR}/meta" -maxdepth 1 -type f | sort
+          ls "${OUT_DIR}/data/chunk-000" | head -3
+          echo "=== dataset-preprocess DONE ==="

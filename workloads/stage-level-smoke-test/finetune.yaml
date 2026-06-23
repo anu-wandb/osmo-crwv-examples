@@ -1,0 +1,289 @@
+version: 2
+# vla-finetune.yaml — GR00T VLA finetune, dataset from W&B av-cosmos-cap-v1:latest
+# Fixed: GLOBAL_BATCH_SIZE=8, GRAD_ACCUM=2, expandable_segments (OOM fix from run-5)
+
+workflow:
+  name: vla-finetune
+  resources:
+    gpu8:
+      platform: gpu
+      gpu: 8
+      cpu: 64
+      memory: 384Gi
+      storage: 500Gi
+
+  groups:
+  - name: finetune-group
+    tasks:
+    - name: groot-finetune
+      lead: true
+      resource: gpu8
+      image: nvcr.io/nvidia/pytorch:25.05-py3
+      command: [bash]
+      args: [/scripts/run.sh]
+      credentials:
+        workflow-secrets:
+          HF_TOKEN: HF_TOKEN
+          WANDB_API_KEY: WANDB_API_KEY
+          WANDB_ENTITY: WANDB_ENTITY
+      files:
+      - path: /scripts/av_vehicle_config.py
+        contents: |
+          from gr00t.configs.data.embodiment_configs import register_modality_config
+          from gr00t.data.embodiment_tags import EmbodimentTag
+          from gr00t.data.types import (
+              ActionConfig, ActionFormat, ActionRepresentation, ActionType, ModalityConfig)
+          av_vehicle_config = {
+              "video":    ModalityConfig(delta_indices=[0], modality_keys=["front_camera"]),
+              "state":    ModalityConfig(delta_indices=[0], modality_keys=["vehicle_state"]),
+              "action":   ModalityConfig(
+                  delta_indices=list(range(16)),
+                  modality_keys=["vehicle_control"],
+                  action_configs=[ActionConfig(rep=ActionRepresentation.ABSOLUTE,
+                      type=ActionType.NON_EEF, format=ActionFormat.DEFAULT)]),
+              "language": ModalityConfig(delta_indices=[0],
+                  modality_keys=["annotation.human.task_description"]),
+          }
+          register_modality_config(av_vehicle_config, embodiment_tag=EmbodimentTag.NEW_EMBODIMENT)
+      - path: /scripts/run.sh
+        contents: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          export BASE_MODEL="${BASE_MODEL:-nvidia/GR00T-N1.6-3B}"
+          export EMBODIMENT_TAG="${EMBODIMENT_TAG:-NEW_EMBODIMENT}"
+          export MAX_STEPS="${MAX_STEPS:-50}"
+          export LEARNING_RATE="${LEARNING_RATE:-5e-5}"
+          export GRAD_ACCUM="${GRAD_ACCUM:-2}"
+          export SAVE_STEPS="${SAVE_STEPS:-2000}"
+          export GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-8}"
+          export WANDB_PROJECT="${WANDB_PROJECT:-osmo-workflow}"
+          export WANDB_DATASET_ARTIFACT="${WANDB_DATASET_ARTIFACT:-wandb-smle/osmo-workflow/av-cosmos-cap-v1:latest}"
+          export DATASET_ROOT="/workspace/dataset_raw/dataset"
+          export OUT="{{output}}"
+          mkdir -p "${OUT}/checkpoint-final"
+
+          export NCCL_P2P_DISABLE=1
+          export NCCL_IB_DISABLE=1
+          export NCCL_DEBUG=WARN
+          export TORCH_NCCL_BLOCKING_WAIT=1
+          export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+          echo "=== vla-finetune: GR00T on NGC PyTorch 25.05 ==="
+          nvidia-smi -L | head -10
+          NGPU=$(nvidia-smi -L | wc -l)
+          echo "GPUs=${NGPU}  BATCH=${GLOBAL_BATCH_SIZE}  GRAD_ACCUM=${GRAD_ACCUM}  STEPS=${MAX_STEPS}"
+
+          apt-get update -y >/dev/null 2>&1 || true
+          apt-get install -y --no-install-recommends git ffmpeg ca-certificates curl >/dev/null 2>&1 || true
+
+          pip install --no-cache-dir \
+            wandb==0.25.0 \
+            transformers==4.51.3 accelerate safetensors==0.4.5 \
+            albumentations==1.4.18 diffusers==0.35.1 dm-tree==0.1.8 \
+            datasets==3.6.0 peft==0.17.1 msgpack==1.1.0 msgpack-numpy==0.4.8 \
+            omegaconf==2.3.0 tyro==0.9.17 \
+            einops scipy termcolor lmdb av pyzmq click \
+            huggingface_hub pyarrow decord opencv-python-headless
+          pip install --no-cache-dir --no-deps "torchcodec==0.4.0" 2>&1 | tail -3 || true
+
+          # Flash-attn smoke-test
+          python - <<'PY' || true
+          import importlib, torch
+          try:
+              fa = importlib.import_module("flash_attn")
+              q = torch.randn(1, 4, 8, 16, device="cuda", dtype=torch.bfloat16)
+              fa.flash_attn_func(q, q, q)
+              print(f"[flash-attn] OK version={getattr(fa,'__version__','?')}")
+          except Exception as e:
+              print(f"[flash-attn] unusable: {e}")
+              import os; os.environ.setdefault("TRANSFORMERS_ATTENTION_IMPLEMENTATION","eager")
+          PY
+
+          # Download dataset from W&B artifact (lands at /workspace/dataset_raw/dataset/)
+          echo "[data] downloading ${WANDB_DATASET_ARTIFACT}"
+          python - <<'PY'
+          import os, wandb
+          api = wandb.Api()
+          art = api.artifact(os.environ["WANDB_DATASET_ARTIFACT"], type="dataset")
+          art.download(root="/workspace/dataset_raw")
+          print(f"[data] downloaded; DATASET_ROOT={os.environ['DATASET_ROOT']}")
+          import pathlib
+          p = pathlib.Path(os.environ["DATASET_ROOT"])
+          for f in sorted(p.rglob("*"))[:15]: print(f" {f}")
+          PY
+
+          # Clone + install Isaac-GR00T
+          if [[ ! -d /workspace/Isaac-GR00T ]]; then
+            git clone --depth 1 --branch n1.6-release https://github.com/NVIDIA/Isaac-GR00T /workspace/Isaac-GR00T
+          fi
+          pip install --no-deps -e /workspace/Isaac-GR00T
+          export PYTHONPATH="/workspace/Isaac-GR00T${PYTHONPATH:+:${PYTHONPATH}}"
+
+          # Patches: wandb project, device shim, DDP, grad-ckpt
+          python - <<'PY'
+          from pathlib import Path
+          for f in Path("/workspace/Isaac-GR00T/gr00t").rglob("*.py"):
+              try: c = f.read_text()
+              except Exception: continue
+              c2 = c.replace('"finetune-gr00t-n1d6"',
+                  '__import__("os").environ.get("WANDB_PROJECT","osmo-workflow")')
+              if c2 != c: f.write_text(c2); print(f"[patch] wandb_project: {f}")
+          shim = (
+            "import os as _os, torch as _torch\n"
+            "if _torch.cuda.is_available():\n"
+            "    _lr = int(_os.environ.get('LOCAL_RANK',_os.environ.get('OMPI_COMM_WORLD_LOCAL_RANK',0)))\n"
+            "    _torch.cuda.set_device(_lr)\n"
+            "    print(f'[device-shim] rank pinned to cuda:{_lr}', flush=True)\n"
+          )
+          p = Path("/workspace/Isaac-GR00T/gr00t/experiment/launch_finetune.py")
+          c = p.read_text(); lines = c.split("\n"); ins = 0
+          for i, ln in enumerate(lines):
+              if ln.startswith("import ") or ln.startswith("from "): ins = i + 1
+          lines.insert(ins, shim); p.write_text("\n".join(lines))
+          p = Path("/workspace/Isaac-GR00T/gr00t/configs/training/training_config.py")
+          c = p.read_text()
+          c = c.replace('use_ddp: bool = False','use_ddp: bool = True')
+          c = c.replace('gradient_checkpointing: bool = False','gradient_checkpointing: bool = True')
+          p.write_text(c)
+          print("[patch] DDP+grad-ckpt applied")
+          PY
+
+          # PyAV video_utils patch
+          python - <<PY_PATCH
+          from pathlib import Path
+          src = Path("/workspace/Isaac-GR00T/gr00t/utils/video_utils.py").read_text()
+          if "import av as _avlib" not in src:
+              src = "import av as _avlib\nimport torch as _torch\n" + src
+          shim = "\n\nclass _AvVideoDecoder:\n"
+          shim += "    def __init__(self, source, **kw):\n"
+          shim += "        self._frames = []\n"
+          shim += "        c = _avlib.open(str(source))\n"
+          shim += "        s = c.streams.video[0]\n"
+          shim += "        for f in c.decode(video=0):\n"
+          shim += "            self._frames.append(_torch.from_numpy(f.to_ndarray(format='rgb24')))\n"
+          shim += "        c.close()\n"
+          shim += "        self.metadata = type('M',(),{'num_frames':len(self._frames),"
+          shim += " 'duration_seconds':len(self._frames)/float(s.average_rate or 10),"
+          shim += " 'average_fps':float(s.average_rate or 10),"
+          shim += " 'height':s.height,'width':s.width})()\n"
+          shim += "    def __len__(self): return len(self._frames)\n"
+          shim += "    def __getitem__(self, i):\n"
+          shim += "        if isinstance(i,(list,tuple)) or hasattr(i,'__iter__'):\n"
+          shim += "            return _torch.stack([self._frames[int(j)] for j in i])\n"
+          shim += "        return self._frames[int(i)]\n"
+          shim += "    def get_frames_at(self, indices):\n"
+          shim += "        return _torch.stack([self._frames[int(j)] for j in indices])\n"
+          shim += "import torchcodec.decoders as _tc_dec\n"
+          shim += "_tc_dec.VideoDecoder = _AvVideoDecoder\n"
+          if "_AvVideoDecoder" not in src:
+              src = src + shim
+          Path("/workspace/Isaac-GR00T/gr00t/utils/video_utils.py").write_text(src)
+          print("[patch] video_utils.py patched")
+          PY_PATCH
+
+          cp /scripts/av_vehicle_config.py /workspace/Isaac-GR00T/av_vehicle_config.py
+
+          # Download GR00T base model
+          pip install --quiet --no-cache-dir hf_transfer 2>&1 | tail -2 || true
+          export HF_HUB_ENABLE_HF_TRANSFER=1
+          export HF_HUB_DOWNLOAD_TIMEOUT=120
+          python - <<"HFPY"
+          import os
+          from huggingface_hub import snapshot_download
+          snapshot_download(os.environ["BASE_MODEL"], local_dir="/workspace/model", token=os.environ.get("HF_TOKEN"), max_workers=16)
+          print("[hf] base model downloaded")
+          HFPY
+          test -f /workspace/model/config.json
+
+          # W&B lineage init
+          python - <<'PY'
+          import os, time
+          from pathlib import Path
+          import wandb
+          run = wandb.init(
+              entity=os.environ.get("WANDB_ENTITY"),
+              project=os.environ.get("WANDB_PROJECT","osmo-workflow"),
+              name="groot-finetune",
+              job_type="finetune", tags=["vla-finetune"],
+              config={"base_model": os.environ["BASE_MODEL"],
+                      "dataset_artifact": os.environ["WANDB_DATASET_ARTIFACT"],
+                      "max_steps": int(os.environ.get("MAX_STEPS",2000)),
+                      "global_batch_size": int(os.environ.get("GLOBAL_BATCH_SIZE",4)),
+                      "grad_accum": int(os.environ.get("GRAD_ACCUM",2))},
+              resume="allow")
+          try:
+              art = run.use_artifact(os.environ["WANDB_DATASET_ARTIFACT"], type="dataset")
+              print(f"[wandb] linked dataset: {art.qualified_name}")
+          except Exception as e:
+              print(f"[wandb] artifact link skipped: {e}")
+          Path("/tmp/wandb_run_id").write_text(run.id)
+          run.finish()
+          print(f"[wandb] run id={run.id}")
+          PY
+          export WANDB_RUN_ID="$(cat /tmp/wandb_run_id)"
+          export WANDB_RESUME=allow
+          export WANDB_NAME="groot-finetune"   # match output-dir basename; HF Trainer names the run after --output-dir
+
+          # Train
+          cd /workspace/Isaac-GR00T
+          mkdir -p /workspace/groot-finetune
+          torchrun --nproc_per_node=${NGPU} --standalone \
+            gr00t/experiment/launch_finetune.py \
+            --dataset-path "${DATASET_ROOT}" \
+            --base-model-path /workspace/model \
+            --output-dir /workspace/groot-finetune \
+            --embodiment-tag "${EMBODIMENT_TAG}" \
+            --modality-config-path /workspace/Isaac-GR00T/av_vehicle_config.py \
+            --num-gpus ${NGPU} \
+            --global-batch-size ${GLOBAL_BATCH_SIZE} \
+            --gradient-accumulation-steps ${GRAD_ACCUM} \
+            --max-steps ${MAX_STEPS} \
+            --save-steps ${SAVE_STEPS} --save-total-limit 4 \
+            --learning-rate ${LEARNING_RATE} --warmup-ratio 0.1 --weight-decay 1e-2 \
+            --dataloader-num-workers 4 \
+            --use-wandb 2>&1 | tee "${OUT}/train.log"
+
+          FINAL_CKPT=$(ls -d /workspace/groot-finetune/checkpoint-* 2>/dev/null | sort -V | tail -1 || true)
+          [[ -z "${FINAL_CKPT}" ]] && { echo "[ERROR] no checkpoint produced"; exit 1; }
+          echo "[ckpt] ${FINAL_CKPT}"
+          cp -r "${FINAL_CKPT}/." "${OUT}/checkpoint-final/"
+
+          python - <<PY
+          import json, os
+          from pathlib import Path
+          ckpt = Path("${FINAL_CKPT}")
+          state = json.load(open(ckpt/"trainer_state.json")) if (ckpt/"trainer_state.json").exists() else {}
+          losses = [e["loss"] for e in state.get("log_history",[]) if "loss" in e]
+          metrics = {"final_checkpoint": ckpt.name,
+                     "best_loss": round(min(losses),4) if losses else None,
+                     "final_loss": round(losses[-1],4) if losses else None,
+                     "max_steps": int(os.environ["MAX_STEPS"]),
+                     "learning_rate": float(os.environ["LEARNING_RATE"])}
+          json.dump(metrics, open("${OUT}/metrics.json","w"), indent=2)
+          print("[metrics]", metrics)
+          PY
+
+          # Log finetuned model artifact
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          import wandb
+          OUT = Path(os.environ["OUT"])
+          rid = Path("/tmp/wandb_run_id").read_text().strip()
+          run = wandb.init(entity=os.environ.get("WANDB_ENTITY"),
+              project=os.environ.get("WANDB_PROJECT","osmo-workflow"), id=rid, resume="must")
+          metrics = json.load(open(OUT/"metrics.json")) if (OUT/"metrics.json").exists() else {}
+          for k, v in metrics.items():
+              if isinstance(v,(int,float)): run.summary[k] = v
+          art = wandb.Artifact("groot-av-finetuned", type="model",
+              description="GR00T N1.6-3B finetuned on Cosmos AV scenes",
+              metadata=metrics)
+          art.add_dir(str(OUT/"checkpoint-final"), name="model")
+          if (OUT/"train.log").exists(): wandb.save(str(OUT/"train.log"), policy="now")
+          run.log_artifact(art).wait()
+          run.finish()
+          print("[wandb] logged groot-av-finetuned artifact")
+          PY
+
+          echo "=== vla-finetune DONE ==="
