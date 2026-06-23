@@ -18,9 +18,9 @@ piece cheaply before spending a full training node:
 
 | Trust level | What | Where | Cost |
 |---|---|---|---|
-| 🐛 **Crawl** | Smoke-test each stage in isolation | [`crawl/`](crawl/) | minutes (finetune smoke needs a node) |
-| 🚶 **Walk** | Run the **whole pipeline** at tiny scale | `pipeline/av-pipeline.yaml --set max_steps=100 n_episodes=2` | ~½ hr |
-| 🏃 **Run** | Run the **whole pipeline** at full scale | `pipeline/av-pipeline.yaml` (defaults) | hours, full 8-GPU node |
+| 🐛 **Crawl** | Smoke-test each stage in isolation | [`workloads/stage-level-smoke-test/`](workloads/stage-level-smoke-test/) | minutes (finetune smoke needs a node) |
+| 🚶 **Walk** | Run the **whole pipeline** at tiny scale | `workloads/full-pipeline/full-pipeline.yaml --set max_steps=100 n_episodes=2` | ~½ hr |
+| 🏃 **Run** | Run the **whole pipeline** at full scale | `workloads/full-pipeline/full-pipeline.yaml` (defaults) | hours, full 8-GPU node |
 
 > 🤖 **Using an AI coding agent on this repo?** Point it at [`AGENTS.md`](AGENTS.md)
 > — the same material plus the operating rules, Osmo schema gotchas, and the
@@ -118,28 +118,28 @@ load, stage 2 **falls back to template captions** and still produces
 
 ## 🐛 Crawl — smoke-test each stage
 
-Each file in [`crawl/`](crawl/) is a **standalone, tiny** version of one stage —
+Each file in [`workloads/stage-level-smoke-test/`](workloads/stage-level-smoke-test/) is a **standalone, tiny** version of one stage —
 the fastest way to prove that stage's code runs green before chaining anything.
 They read the prior stage's `:latest` artifact from W&B and log their own, so you
 can run them **in order** as an end-to-end plumbing check, or individually
 against existing artifacts.
 
 ```bash
-osmo workflow validate crawl/dataset-preprocess.yaml --pool default   # always validate first (free)
-osmo workflow submit   crawl/dataset-preprocess.yaml --pool default    # → av-forklift-v1
-osmo workflow submit   crawl/cosmos-cap.yaml         --pool default    # → av-cosmos-cap-v1
-osmo workflow submit   crawl/finetune.yaml           --pool default    # 50 steps → groot-av-finetuned
-osmo workflow submit   crawl/eval.yaml               --pool default    # 1 episode
+osmo workflow validate workloads/stage-level-smoke-test/dataset-preprocess.yaml --pool default   # always validate first (free)
+osmo workflow submit   workloads/stage-level-smoke-test/dataset-preprocess.yaml --pool default    # → av-forklift-v1
+osmo workflow submit   workloads/stage-level-smoke-test/cosmos-cap.yaml         --pool default    # → av-cosmos-cap-v1
+osmo workflow submit   workloads/stage-level-smoke-test/finetune.yaml           --pool default    # 50 steps → groot-av-finetuned
+osmo workflow submit   workloads/stage-level-smoke-test/eval.yaml               --pool default    # 1 episode
 ```
 
 | File | Tests | Scale | GPUs |
 |------|-------|-------|------|
-| `crawl/dataset-preprocess.yaml` | data conversion | full dataset (CPU, fast) | 0 |
-| `crawl/cosmos-cap.yaml` | Cosmos captioning + vLLM serve | full | 2 |
-| `crawl/finetune.yaml` | GR00T DDP training loop | **50 steps** | 8 |
-| `crawl/eval.yaml` | Isaac Sim + policy rollout | **1 episode** | 2 |
+| `workloads/stage-level-smoke-test/dataset-preprocess.yaml` | data conversion | full dataset (CPU, fast) | 0 |
+| `workloads/stage-level-smoke-test/cosmos-cap.yaml` | Cosmos captioning + vLLM serve | full | 2 |
+| `workloads/stage-level-smoke-test/finetune.yaml` | GR00T DDP training loop | **50 steps** | 8 |
+| `workloads/stage-level-smoke-test/eval.yaml` | Isaac Sim + policy rollout | **1 episode** | 2 |
 
-> Smoke tests share the production artifact namespace. `crawl/finetune.yaml`
+> Smoke tests share the production artifact namespace. `workloads/stage-level-smoke-test/finetune.yaml`
 > produces a **throwaway ~50-step model** — re-run the full pipeline for a real
 > one. Because they are single-task workflows, you can override scale at submit
 > with `--set-env` (e.g. `--set-env MAX_STEPS=20`).
@@ -148,7 +148,7 @@ osmo workflow submit   crawl/eval.yaml               --pool default    # 1 episo
 
 ## 🚶 Walk / 🏃 Run — the full pipeline
 
-Both use the **same file**, [`pipeline/av-pipeline.yaml`](pipeline/av-pipeline.yaml)
+Both use the **same file**, [`workloads/full-pipeline/full-pipeline.yaml`](workloads/full-pipeline/full-pipeline.yaml)
 — one Osmo workflow with all stages and the **parallel base-vs-finetuned eval**.
 Scale is parameterized with Osmo `--set` (templated `{{ max_steps }}` /
 `{{ n_episodes }}`, defaulting to full scale in the file's `default-values:`).
@@ -157,17 +157,17 @@ Scale is parameterized with Osmo `--set` (templated `{{ max_steps }}` /
 osmo resource list                                              # confirm a free 8-GPU node
 
 # 🚶 Walk — tiny end-to-end, proves the whole DAG hangs together cheaply
-osmo workflow submit pipeline/av-pipeline.yaml --pool default \
+osmo workflow submit workloads/full-pipeline/full-pipeline.yaml --pool default \
   --set max_steps=100 n_episodes=2
 
 # 🏃 Run — full scale (uses default-values: max_steps=6000, n_episodes=20)
-osmo workflow submit pipeline/av-pipeline.yaml --pool default
+osmo workflow submit workloads/full-pipeline/full-pipeline.yaml --pool default
 ```
 
 > **Why `--set`, not `--set-env`?** In a *multi-task* pipeline, `--set-env`
 > reaches only the lead task — it will **not** change `MAX_STEPS` on the finetune
 > task. `--set` does submit-time templating of `{{ field }}` and is reliable
-> across all tasks. (`--set-env` *does* work for the single-task `crawl/` files.)
+> across all tasks. (`--set-env` *does* work for the single-task `workloads/stage-level-smoke-test/` files.)
 
 **Scale knobs** (`--set <field>=<value>`):
 
@@ -214,18 +214,19 @@ osmo workflow cancel   <workflow-id>
 
 ```
 osmo-crwv-examples/
-├── README.md                         ← you are here
-├── AGENTS.md                         ← operating guide for AI coding agents
-├── crawl/                            ← 🐛 smoke-test each stage (standalone, tiny)
-│   ├── dataset-preprocess.yaml
-│   ├── cosmos-cap.yaml
-│   ├── finetune.yaml                 (50 steps)
-│   └── eval.yaml                     (1 episode)
-└── pipeline/
-    └── av-pipeline.yaml              ← 🚶 walk (--set small) / 🏃 run (defaults)
+├── README.md                                 ← you are here
+├── AGENTS.md                                 ← operating guide for AI coding agents
+└── workloads/
+    ├── stage-level-smoke-test/               ← 🐛 smoke-test each stage (standalone, tiny)
+    │   ├── dataset-preprocess.yaml
+    │   ├── cosmos-cap.yaml
+    │   ├── finetune.yaml                     (50 steps)
+    │   └── eval.yaml                         (1 episode)
+    └── full-pipeline/
+        └── full-pipeline.yaml                ← 🚶 walk (--set small) / 🏃 run (defaults)
 ```
 
-The `crawl/` files are the **source of truth per stage**; `pipeline/av-pipeline.yaml`
+The `workloads/stage-level-smoke-test/` files are the **source of truth per stage**; `workloads/full-pipeline/full-pipeline.yaml`
 is assembled from them (with the eval fanned out into parallel base/finetuned
-tasks + a compare). Change a stage in `crawl/`, prove it, then refold it into the
+tasks + a compare). Change a stage in `workloads/stage-level-smoke-test/`, prove it, then refold it into the
 pipeline.

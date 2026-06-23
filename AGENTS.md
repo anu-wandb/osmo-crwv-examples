@@ -16,18 +16,18 @@ cluster), tracked through **Weights & Biases**. It is organized **crawl → walk
 run**:
 
 ```
-crawl/   standalone smoke test per stage (tiny)         ← source of truth per stage
-pipeline/av-pipeline.yaml   full DAG, parallel eval     ← assembled from crawl/
+workloads/stage-level-smoke-test/   standalone smoke test per stage (tiny)         ← source of truth per stage
+workloads/full-pipeline/full-pipeline.yaml   full DAG, parallel eval     ← assembled from workloads/stage-level-smoke-test/
             dataset-preprocess → cosmos-cap → vla-finetune → {base-eval ‖ finetuned-eval} → compare
                 (gpu:0)            (2 GPU)       (8 GPU)         (2 GPU each)              (cpu)
 ```
 
 | Stage | crawl file | pipeline task | image | out artifact |
 |-------|-----------|---------------|-------|--------------|
-| preprocess | `crawl/dataset-preprocess.yaml` | `preprocess` | `pytorch:25.05-py3` | `av-forklift-v1` |
-| caption | `crawl/cosmos-cap.yaml` | `cosmos-cap` | `pytorch:25.05-py3` | `av-cosmos-cap-v1` |
-| finetune | `crawl/finetune.yaml` | `groot-finetune` | `pytorch:25.05-py3` | `groot-av-finetuned` |
-| eval | `crawl/eval.yaml` | `base-eval` + `finetuned-eval` | `isaac-lab:2.3.2` | eval summaries |
+| preprocess | `workloads/stage-level-smoke-test/dataset-preprocess.yaml` | `preprocess` | `pytorch:25.05-py3` | `av-forklift-v1` |
+| caption | `workloads/stage-level-smoke-test/cosmos-cap.yaml` | `cosmos-cap` | `pytorch:25.05-py3` | `av-cosmos-cap-v1` |
+| finetune | `workloads/stage-level-smoke-test/finetune.yaml` | `groot-finetune` | `pytorch:25.05-py3` | `groot-av-finetuned` |
+| eval | `workloads/stage-level-smoke-test/eval.yaml` | `base-eval` + `finetuned-eval` | `isaac-lab:2.3.2` | eval summaries |
 | compare | — | `compare` | `pytorch:25.05-py3` | `comparison.json` |
 
 **Ordering is `inputs:`; data moves via W&B `:latest` artifacts** (there is no
@@ -37,10 +37,10 @@ The pipeline's eval is **fanned out into two parallel tasks** (`base-eval` loads
 `nvidia/GR00T-N1.6-3B`; `finetuned-eval` loads `groot-av-finetuned`), then
 `compare` reads both summaries (`{{input:0}}` / `{{input:1}}`) and logs a verdict.
 
-The `crawl/` standalone files are the **source of truth per stage**. The pipeline
+The `workloads/stage-level-smoke-test/` standalone files are the **source of truth per stage**. The pipeline
 is assembled from them (the eval task is transformed into the two single-policy
-tasks via an `EVAL_MODEL` env switch). **Change a stage in `crawl/`, prove it,
-then refold it into `pipeline/av-pipeline.yaml`.**
+tasks via an `EVAL_MODEL` env switch). **Change a stage in `workloads/stage-level-smoke-test/`, prove it,
+then refold it into `workloads/full-pipeline/full-pipeline.yaml`.**
 
 ---
 
@@ -52,8 +52,8 @@ then refold it into `pipeline/av-pipeline.yaml`.**
 2. **Never copy `platform` / `pool` / resource identifiers from an existing
    YAML.** They may be stale or from a different cluster. **Verify every
    identifier fresh from the live CLI** (`osmo pool list`, `osmo resource list`).
-3. **`crawl/` files are the source of truth.** Edit the stage there, validate it,
-   then regenerate the matching task(s) in `pipeline/av-pipeline.yaml`. Keep them
+3. **`workloads/stage-level-smoke-test/` files are the source of truth.** Edit the stage there, validate it,
+   then regenerate the matching task(s) in `workloads/full-pipeline/full-pipeline.yaml`. Keep them
    in sync.
 4. **`osmo workflow validate <file> --pool default` before every submit** — free,
    catches schema errors.
@@ -88,7 +88,7 @@ Osmo has two override flags, and **the difference cost a wasted 5-hour run**:
   the YAML, backed by a top-level `default-values:` section. **Reaches every task,
   reliably.** This is how the **pipeline** is parameterized:
   ```bash
-  osmo workflow submit pipeline/av-pipeline.yaml --pool default --set max_steps=100 n_episodes=2
+  osmo workflow submit workloads/full-pipeline/full-pipeline.yaml --pool default --set max_steps=100 n_episodes=2
   ```
   `{{ max_steps }}` and `{{ n_episodes }}` are in the run scripts; `default-values:`
   holds the full-scale defaults (`max_steps: 6000`, `n_episodes: 20`). `{{ field }}`
@@ -99,7 +99,7 @@ Osmo has two override flags, and **the difference cost a wasted 5-hour run**:
 - **`--set-env KEY=VALUE`** — injects an env var, but in a **multi-task** pipeline
   it reaches **only the lead task** (`compare`), *not* the finetune. It silently
   fell back to the default and trained the wrong step count. **Only use
-  `--set-env` for the single-task `crawl/` files** (where it works, since the one
+  `--set-env` for the single-task `workloads/stage-level-smoke-test/` files** (where it works, since the one
   task is the lead). Those files read `${MAX_STEPS:-50}` / `${N_EPISODES:-1}`.
 
 **Rule of thumb:** pipeline → `--set` (templated). crawl → `--set-env` (or just
@@ -136,12 +136,12 @@ edit the default). When in doubt, `--dry-run` and grep the rendered YAML.
 
 ## How to test a change
 
-Cheapest path that catches the failure — iterate on the **`crawl/` file**, then
+Cheapest path that catches the failure — iterate on the **`workloads/stage-level-smoke-test/` file**, then
 regenerate the pipeline task:
 
 ```bash
-osmo workflow validate crawl/<stage>.yaml --pool default   # 1. schema check (free)
-osmo workflow submit   crawl/<stage>.yaml --pool default    # 2. submit the one stage
+osmo workflow validate workloads/stage-level-smoke-test/<stage>.yaml --pool default   # 1. schema check (free)
+osmo workflow submit   workloads/stage-level-smoke-test/<stage>.yaml --pool default    # 2. submit the one stage
 osmo workflow query    <id>                                 # 3. poll status
 osmo workflow logs     <id> --task <task> -n 200            # 4. inspect
 osmo workflow logs     <id> --error                         # 5. error stream on failure
@@ -149,7 +149,7 @@ osmo workflow logs     <id> --error                         # 5. error stream on
 
 Then a **walk** (tiny full pipeline) before a **run**:
 ```bash
-osmo workflow submit pipeline/av-pipeline.yaml --pool default --set max_steps=100 n_episodes=2
+osmo workflow submit workloads/full-pipeline/full-pipeline.yaml --pool default --set max_steps=100 n_episodes=2
 ```
 
 ---
@@ -242,8 +242,8 @@ drive or fork-height, and do not auto-attach the pallet from anywhere.
 
 | Building | Copy from |
 |----------|-----------|
-| preprocess logic | `crawl/dataset-preprocess.yaml` |
-| captioning logic | `crawl/cosmos-cap.yaml` |
-| finetune logic | `crawl/finetune.yaml` |
-| eval logic | `crawl/eval.yaml` |
-| chained e2e (parallel eval) | `pipeline/av-pipeline.yaml` (assembled from the four above) |
+| preprocess logic | `workloads/stage-level-smoke-test/dataset-preprocess.yaml` |
+| captioning logic | `workloads/stage-level-smoke-test/cosmos-cap.yaml` |
+| finetune logic | `workloads/stage-level-smoke-test/finetune.yaml` |
+| eval logic | `workloads/stage-level-smoke-test/eval.yaml` |
+| chained e2e (parallel eval) | `workloads/full-pipeline/full-pipeline.yaml` (assembled from the four above) |
