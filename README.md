@@ -10,22 +10,27 @@
 
 A reference **Physical AI / robotics pipeline** that takes a real teleop forklift
 dataset all the way to an in-simulation policy evaluation, running end-to-end on
-**[NVIDIA Osmo](https://nvidia.github.io/OSMO/)** workflows over a **CoreWeave**
-GPU cluster, with **Weights & Biases** as the experiment tracker *and* the data
-bus between stages.
+**[NVIDIA Osmo](https://nvidia.github.io/OSMO/)** workflows over a **[CoreWeave](https://www.coreweave.com/)**
+GPU cluster, with **[Weights & Biases](https://wandb.ai/site/experiment-tracking/)** as the experiment and artifact tracking system of record. 
 
-<p align="center">
-  <img src="./assets/Osmo-DAG.png" alt="Weights & Biases" />
-</p>
-
-<p align="center">
-  <img src="./assets/W&B-linage-view.png" alt="Weights & Biases" />
-</p>
-
-It is organized as a **crawl → walk → run** progression so you can prove each
+This repo is organized as a **crawl → walk → run** progression so you can prove each
 piece cheaply before spending a full training node:
 
-| Trust level | What | Where | Cost |
+<p align="center">
+  <img src="./assets/Osmo-DAG.png" width="400" alt="Weights & Biases" />
+</p>
+
+<p align="center"><em>Osmo DAG showing our PAI Workflow</em></p>
+
+
+<p align="center">
+  <img src="./assets/W&B-linage-view.png" width="5000" alt="Weights & Biases" />
+</p>
+
+<p align="center"><em>Weights & Biases workspace tracking linage of all generated artifacts and associated workdlows</em></p>
+
+
+| Level | What | Where | Cost |
 |---|---|---|---|
 | 🐛 **Crawl** | Smoke-test each stage in isolation | [`workloads/stage-level-smoke-test/`](workloads/stage-level-smoke-test/) | minutes (finetune smoke needs a node) |
 | 🚶 **Walk** | Run the **whole pipeline** at tiny scale | `workloads/full-pipeline/full-pipeline.yaml --set max_steps=100 n_episodes=2` | ~½ hr |
@@ -58,7 +63,7 @@ image is available`; prebuilt flash-attn doesn't cover sm_120 (the stages fall
 back to an SDPA path). The 8-GPU finetune needs a *whole* free node — check
 `osmo resource list` before submitting.
 
-### Weights & Biases — tracker **and** data bus
+### Weights & Biases — experiment and artifact tracker 
 [W&B](https://wandb.ai) does double duty here. Beyond the usual metrics, videos,
 and run history, **artifacts are how stages hand data to each other** — there is
 no shared filesystem between Osmo tasks. Each stage *downloads* the previous
@@ -78,13 +83,13 @@ YAML only enforce *ordering* — the **data** moves through W&B.
 
 ## The pipeline stages
 
-| # | Stage | Container | Does | Output artifact |
-|---|-------|-----------|------|-----------------|
-| 1 | **dataset-preprocess** | `pytorch:25.05` | `tduggan93/forklift` (152 eps) → GR00T LeRobot v2.1: per-episode parquets, 448×448 mp4s, **9-D state / 3-D action `[steer, throttle, lift]`**, `modality.json` | `av-forklift-v1` |
-| 2 | **cosmos-cap** | `pytorch:25.05` | Cosmos3-Nano Reasoner (vLLM) captions each clip; per-episode language | `av-cosmos-cap-v1` |
-| 3 | **vla-finetune** | `pytorch:25.05` | GR00T **N1.6-3B** finetune, DDP across 8 GPUs; W&B run `groot-finetune` | `groot-av-finetuned` |
-| 4a/4b | **base-eval ∥ finetuned-eval** | `isaac-lab:2.3.2` | Isaac Sim forklift eval, **in parallel**: base `nvidia/GR00T-N1.6-3B` vs the finetuned policy. W&B runs `sim-eval-base-model` / `sim-eval-finetuned-model` | eval summaries |
-| 5 | **compare** | `pytorch:25.05` | reads both eval summaries, logs the delta + verdict | `comparison.json` |
+| # | Stage | Container | Does | Output artifact | View Workspace
+|---|-------|-----------|------|-----------------|---------------|
+| 1 | **dataset-preprocess** | `pytorch:25.05` | `tduggan93/forklift` (152 eps) → GR00T LeRobot v2.1: per-episode parquets, 448×448 mp4s, **9-D state / 3-D action `[steer, throttle, lift]`**, `modality.json` | `av-forklift-v1` | [Dataset Exploration](https://wandb.ai/wandb-smle/osmo-workflow?nw=efikm97ky5)
+| 2 | **cosmos-cap** | `pytorch:25.05` | Cosmos3-Nano Reasoner (vLLM) captions each clip; per-episode language | `av-cosmos-cap-v1` | [Dataset Exploration](https://wandb.ai/wandb-smle/osmo-workflow?nw=efikm97ky5)
+| 3 | **vla-finetune** | `pytorch:25.05` | GR00T **N1.6-3B** finetune, DDP across 8 GPUs; W&B run `groot-finetune` | `groot-av-finetuned` | [Training Results](https://wandb.ai/wandb-smle/osmo-workflow?nw=sld6hn8d3v)
+| 4a/4b | **base-eval ∥ finetuned-eval** | `isaac-lab:2.3.2` | Isaac Sim forklift eval, **in parallel**: base `nvidia/GR00T-N1.6-3B` vs the finetuned policy. W&B runs `sim-eval-base-model` / `sim-eval-finetuned-model` | eval summaries | [Evaluatio Workspace](https://wandb.ai/wandb-smle/osmo-workflow?nw=e2ge6zxmu7n)
+| 5 | **compare** | `pytorch:25.05` | reads both eval summaries, logs the delta + verdict | `comparison.json` | [Evaluatio Workspace](https://wandb.ai/wandb-smle/osmo-workflow?nw=e2ge6zxmu7n)
 
 **The eval is honest about what the policy controls.** Drive (`throttle`/`steer`
 → root velocity) and fork-height (`lift` → fork joint) are **VLA-driven** — if the
